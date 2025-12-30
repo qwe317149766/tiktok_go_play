@@ -1,0 +1,8 @@
+.idea/
+bin/
+logs/
+dgmain3.exe
+error.log
+devices.txt
+results.jsonl
+# src/  # 注释掉，允许frontend/src目录被跟踪

@@ -1,0 +1,27 @@
+# Python 依赖（覆盖仓库根目录下 *.py / headers/ / mssdk/ / tt_protobuf/ 的第三方 import）
+# 安装：pip install -r requirements.txt
+
+# HTTP / Async HTTP
+curl_cffi==0.14.0
+requests==2.32.3
+urllib3==2.2.3
+
+# Crypto
+pycryptodome==3.21.0
+cryptography==44.0.0
+gmssl==3.2.2
+ecdsa==0.19.0
+
+# Protobuf (tt_protobuf/tk_pb2.py 依赖)
+# 注意：仓库内的 tk_pb2.py 是用 protobuf 6.32.1 gencode 生成的，
+# 运行时 protobuf 也必须是同一主版本（6.x），否则会报版本不匹配。
+protobuf==6.32.1
+
+# Progress bar（mwzzzh_spider.py 可选）
+tqdm==4.67.1
+
+# Redis / env
+redis==5.2.0
+python-dotenv==1.0.1
+
+

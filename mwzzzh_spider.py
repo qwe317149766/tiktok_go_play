@@ -5,6 +5,7 @@ import os
 import random
 import traceback
 import time
+import platform
 from itertools import cycle
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any
@@ -15,20 +16,96 @@ from curl_cffi.requests import AsyncSession
 from device_register.dgmain2.register_logic import run_registration_flow
 
 
+def _load_env_for_runtime() -> str | None:
+    """
+    为 mwzzzh_spider 载入环境配置：
+    - Windows: .env.windows / env.windows
+    - Linux:   .env.linux   / env.linux
+    """
+    sysname = platform.system().lower()
+    if "windows" in sysname:
+        candidates = [".env.windows", "env.windows"]
+    else:
+        candidates = [".env.linux", "env.linux"]
+
+    env_path = None
+    for p in candidates:
+        if os.path.exists(p):
+            env_path = p
+            break
+
+    if not env_path:
+        return None
+
+    try:
+        from dotenv import load_dotenv  # type: ignore
+    except Exception:
+        return env_path
+
+    # 以文件为准，避免系统环境变量残留导致配置不生效
+    load_dotenv(env_path, override=True)
+    return env_path
+
+
+_MWZZZH_ENV_FILE = _load_env_for_runtime()
+
+def _get_int_from_env(*names: str, default: int) -> int:
+    """
+    按优先级读取多个环境变量中的第一个“可解析为 int”的值。
+    例如：优先 MWZZZH_TASKS，其次 MAX_GENERATE。
+    """
+    for name in names:
+        v = os.getenv(name)
+        if v is None:
+            continue
+        v = v.strip()
+        if not v:
+            continue
+        try:
+            return int(v)
+        except Exception:
+            continue
+    return default
+
+
+def _clamp(n: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, n))
+
+
+def _auto_thread_pool_size() -> int:
+    """
+    解析线程池默认按机器 CPU 自动计算（不依赖 GEN_CONCURRENCY）。
+    经验值：CPU 核心数 * 2，并限制在 [4, 64]
+    """
+    cores = os.cpu_count() or 4
+    return _clamp(int(cores) * 2, 4, 64)
+
+
 # ================= 1. 配置区域 =================
 class Config:
     # 网络并发数 (Async Semaphores)
-    MAX_CONCURRENCY = 200
+    # 统一并发主开关：GEN_CONCURRENCY
+    MAX_CONCURRENCY = _get_int_from_env("GEN_CONCURRENCY", default=200)
 
     # 线程池大小 (建议设置为 CPU 核心数 * 1 到 2 倍)
     # 如果你的解析逻辑特别重，可以开大一点，比如 16 或 32
-    THREAD_POOL_SIZE = 16
+    # 默认自动按 CPU 推导（可用 GEN_THREAD_POOL_SIZE 显式覆盖）
+    THREAD_POOL_SIZE = _get_int_from_env(
+        "GEN_THREAD_POOL_SIZE",
+        "THREAD_POOL_SIZE",
+        default=_auto_thread_pool_size(),
+    )
 
     PROXIES = [
     ]
 
     RESULT_FILE = "results12_21_5.jsonl"
     ERROR_FILE = "error.log"
+    # 任务数量：
+    # - 优先 MWZZZH_TASKS
+    # - 若未配置，则复用 MAX_GENERATE（与你的设备生成配置保持一致）
+    # - 再否则默认 1000
+    TASKS = _get_int_from_env("MWZZZH_TASKS", "MAX_GENERATE", default=1000)
 
 
 # ================= 2. 日志系统 =================
@@ -167,7 +244,7 @@ class SpiderEngine:
         await self.pipeline.start()
 
         # 生成任务
-        tasks_data = [{"id": i} for i in range(1000)]
+        tasks_data = [{"id": i} for i in range(Config.TASKS)]
         logger.info(f"开始任务，网络并发: {Config.MAX_CONCURRENCY}, 解析线程: {Config.THREAD_POOL_SIZE}")
 
         coroutines = []
