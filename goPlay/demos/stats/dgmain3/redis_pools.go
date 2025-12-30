@@ -16,6 +16,51 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
+func GetDeviceMinAgeHours() int {
+	// 设备最小“年龄”（小时）：只使用 create_time 早于 now-Nh 的设备
+	// 0=不筛选
+	v := envInt("STATS_DEVICE_MIN_AGE_HOURS", 0)
+	if v < 0 {
+		return 0
+	}
+	return v
+}
+
+func devicePassMinAge(deviceJSON string, minAgeHours int) bool {
+	if minAgeHours <= 0 {
+		return true
+	}
+	deviceJSON = strings.TrimSpace(deviceJSON)
+	if deviceJSON == "" {
+		return false
+	}
+
+	// 设备 JSON 里有 create_time: "YYYY-MM-DD HH:MM:SS"
+	var m map[string]any
+	if err := json.Unmarshal([]byte(deviceJSON), &m); err != nil {
+		return false
+	}
+
+	ctRaw, ok := m["create_time"]
+	if !ok {
+		return false
+	}
+	ctStr, ok := ctRaw.(string)
+	if !ok {
+		return false
+	}
+	ctStr = strings.TrimSpace(ctStr)
+	if ctStr == "" {
+		return false
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", ctStr, time.Local)
+	if err != nil {
+		return false
+	}
+	threshold := time.Now().Add(-time.Duration(minAgeHours) * time.Hour)
+	return t.Before(threshold) || t.Equal(threshold)
+}
+
 func envBool(name string, def bool) bool {
 	v := strings.TrimSpace(os.Getenv(name))
 	if v == "" {
@@ -376,6 +421,8 @@ func loadDevicesFromRedisN(target int) ([]string, error) {
 
 	out := make([]string, 0, target)
 	seen := make(map[string]bool, target)
+	minAge := GetDeviceMinAgeHours()
+	skippedTooNew := 0
 
 	var cursor uint64 = 0
 	for page := 0; page < 200; page++ { // 上限保护：最多扫 200 页
@@ -405,6 +452,10 @@ func loadDevicesFromRedisN(target int) ([]string, error) {
 				if !ok || strings.TrimSpace(s) == "" {
 					continue
 				}
+				if !devicePassMinAge(s, minAge) {
+					skippedTooNew++
+					continue
+				}
 				out = append(out, s)
 				if len(out) >= target {
 					return out, nil
@@ -418,6 +469,9 @@ func loadDevicesFromRedisN(target int) ([]string, error) {
 	}
 
 	if len(out) == 0 {
+		if minAge > 0 {
+			return nil, fmt.Errorf("redis device pool empty or no valid data after minAgeHours=%d filter (skipped=%d): %s", minAge, skippedTooNew, idsKey)
+		}
 		return nil, fmt.Errorf("redis device pool empty or no valid data: %s", idsKey)
 	}
 	return out, nil
@@ -437,6 +491,7 @@ func pickOneDeviceFromRedis(exclude map[string]bool) (string, string, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
+	minAge := GetDeviceMinAgeHours()
 
 	var cursor uint64 = 0
 	// 最多扫 50 页，避免极端情况下无限循环
@@ -456,6 +511,9 @@ func pickOneDeviceFromRedis(exclude map[string]bool) (string, string, error) {
 			if err != nil || strings.TrimSpace(raw) == "" {
 				continue
 			}
+			if !devicePassMinAge(raw, minAge) {
+				continue
+			}
 			return id, raw, nil
 		}
 
@@ -463,6 +521,9 @@ func pickOneDeviceFromRedis(exclude map[string]bool) (string, string, error) {
 		if cursor == 0 {
 			break
 		}
+	}
+	if minAge > 0 {
+		return "", "", fmt.Errorf("no replacement device available in redis (all excluded/too new/empty) minAgeHours=%d: %s", minAge, idsKey)
 	}
 	return "", "", fmt.Errorf("no replacement device available in redis (all excluded or empty): %s", idsKey)
 }

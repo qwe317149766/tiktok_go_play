@@ -1094,6 +1094,10 @@ func main() {
 			for scanner.Scan() {
 				line := strings.TrimSpace(scanner.Text())
 				if line != "" {
+					// 可选：筛选“创建时间早于 N 小时”的设备
+					if !devicePassMinAge(line, GetDeviceMinAgeHours()) {
+						continue
+					}
 					config.Devices = append(config.Devices, line)
 				}
 			}
@@ -1109,6 +1113,9 @@ func main() {
 				for scanner.Scan() {
 					line := strings.TrimSpace(scanner.Text())
 					if line != "" {
+						if !devicePassMinAge(line, GetDeviceMinAgeHours()) {
+							continue
+						}
 						config.Devices = append(config.Devices, line)
 					}
 				}
@@ -1117,7 +1124,11 @@ func main() {
 				os.Exit(1)
 			}
 		}
-		fmt.Printf("已从文件加载 %d 个设备\n", len(config.Devices))
+		if h := GetDeviceMinAgeHours(); h > 0 {
+			fmt.Printf("已从文件加载 %d 个设备（create_time 早于 %d 小时）\n", len(config.Devices), h)
+		} else {
+			fmt.Printf("已从文件加载 %d 个设备\n", len(config.Devices))
+		}
 	}
 
 	if len(config.Proxies) == 0 || len(config.Devices) == 0 {
