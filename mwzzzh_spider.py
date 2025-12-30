@@ -315,6 +315,14 @@ class Config:
     # 单轮补齐最大注册数量（避免一次补太多）
     POLL_BATCH_MAX = _get_int_from_env("MWZZZH_POLL_BATCH_MAX", default=TASKS)
 
+    # keep-alive / Session 复用（连接复用 + 达到最大请求数自动淘汰重建）
+    # - 默认开启（提升性能，减少握手/建连）
+    # - MWZZZH_SESSION_MAX_REQUESTS：每个 Session 最多处理多少次“任务”（达到后淘汰重建）
+    KEEPALIVE = _parse_bool(os.getenv("MWZZZH_KEEPALIVE"), True)
+    SESSION_POOL_SIZE = _get_int_from_env("MWZZZH_SESSION_POOL_SIZE", default=MAX_CONCURRENCY)
+    SESSION_MAX_REQUESTS = _get_int_from_env("MWZZZH_SESSION_MAX_REQUESTS", default=200)
+    IMPERSONATE = os.getenv("MWZZZH_IMPERSONATE", "chrome131_android")
+
 
 # ================= 2. 日志系统 =================
 logger = logging.getLogger("mwzzzh_spider")
@@ -502,26 +510,84 @@ def sync_parsing_logic(type,resp,device, *args):
 
 
 # ================= 5. 核心：异步业务流程 (在主循环运行) =================
-async def user_custom_logic(task_id, task_params, proxy, pipeline, thread_pool):
+async def user_custom_logic(session: AsyncSession, task_id, task_params, proxy, pipeline, thread_pool):
     """
     这里负责指挥：
     1. 遇到 IO (网络) -> await curl_cffi
     2. 遇到 CPU (计算) -> run_in_executor (扔给线程)
     """
-    async with AsyncSession(impersonate="chrome131_android") as session:
-        try:
-            # 直接把 thread_pool 传给业务层
-            device1 = await run_registration_flow(session, proxy, thread_pool, task_id)
-            if type(device1)==dict:
-                # 传 task_id 用于“按线程数分片写文件”：idx = task_id % FILE_SHARDS
-                await pipeline.save(device1, shard_key=task_id)
-                logger.info(f"[{task_id}] 注册成功")
-            else:
-                logger.warning(f"[{task_id}] 注册失败 (返回 None),{device1}")
+    try:
+        # 直接把 thread_pool 传给业务层
+        device1 = await run_registration_flow(session, proxy, thread_pool, task_id)
+        if type(device1)==dict:
+            # 传 task_id 用于“按线程数分片写文件”：idx = task_id % FILE_SHARDS
+            await pipeline.save(device1, shard_key=task_id)
+            logger.info(f"[{task_id}] 注册成功")
+        else:
+            logger.warning(f"[{task_id}] 注册失败 (返回 None),{device1}")
 
-        except Exception as e:
-            logger.error(f"[{task_id}] 致命报错: {e}")
-            logger.error(traceback.format_exc())
+    except Exception as e:
+        logger.error(f"[{task_id}] 致命报错: {e}")
+        logger.error(traceback.format_exc())
+
+
+class _SessionHolder:
+    def __init__(self, idx: int):
+        self.idx = idx
+        self.session: AsyncSession | None = None
+        self.used_tasks = 0
+
+    async def ensure(self) -> AsyncSession:
+        if self.session is None:
+            self.session = AsyncSession(impersonate=Config.IMPERSONATE)
+            self.used_tasks = 0
+        return self.session
+
+    async def recycle(self) -> None:
+        if self.session is not None:
+            try:
+                await self.session.close()
+            except Exception:
+                pass
+        self.session = None
+        self.used_tasks = 0
+
+
+class SessionPool:
+    """
+    keep-alive Session 池：
+    - 每个 worker 从池里借一个 session（独占），用完归还
+    - 每个 session 使用次数达到 SESSION_MAX_REQUESTS 后自动淘汰重建
+    """
+    def __init__(self, size: int):
+        self.size = max(1, int(size))
+        self.q: asyncio.Queue[_SessionHolder] = asyncio.Queue()
+        for i in range(self.size):
+            self.q.put_nowait(_SessionHolder(i))
+
+    async def acquire(self) -> _SessionHolder:
+        return await self.q.get()
+
+    async def release(self, h: _SessionHolder) -> None:
+        # 达到最大次数：淘汰并重建（下次 ensure 会新建）
+        if Config.SESSION_MAX_REQUESTS > 0 and h.used_tasks >= Config.SESSION_MAX_REQUESTS:
+            logger.info(f"[keepalive] recycle session idx={h.idx} used_tasks={h.used_tasks} max={Config.SESSION_MAX_REQUESTS}")
+            await h.recycle()
+        self.q.put_nowait(h)
+
+    async def close(self) -> None:
+        # 尽量关闭所有 session（把队列里的都拿出来关）
+        items: list[_SessionHolder] = []
+        while not self.q.empty():
+            try:
+                items.append(self.q.get_nowait())
+            except Exception:
+                break
+        for h in items:
+            await h.recycle()
+        # 放回去（避免后续误用）
+        for h in items:
+            self.q.put_nowait(h)
 
 
 # ================= 6. 引擎 =================
@@ -547,6 +613,10 @@ class SpiderEngine:
         # 【新增】计算型线程池
         # max_workers 决定了同一时刻最多有多少个解析任务在跑
         self.cpu_pool = ThreadPoolExecutor(max_workers=Config.THREAD_POOL_SIZE, thread_name_prefix="CpuWorker")
+        self.session_pool: SessionPool | None = None
+        if Config.KEEPALIVE:
+            self.session_pool = SessionPool(size=max(1, int(Config.SESSION_POOL_SIZE)))
+            logger.info(f"[keepalive] enabled pool_size={self.session_pool.size} max_requests={Config.SESSION_MAX_REQUESTS} impersonate={Config.IMPERSONATE}")
 
     def get_proxy(self):
         return next(self.proxy_cycle)
@@ -554,8 +624,19 @@ class SpiderEngine:
     async def _worker_wrapper(self, task_id, task_params):
         async with self.sem:
             try:
-                # 把线程池传进去
-                await user_custom_logic(task_id, task_params, self.get_proxy(), self.pipeline, self.cpu_pool)
+                proxy = self.get_proxy()
+                if self.session_pool is None:
+                    async with AsyncSession(impersonate=Config.IMPERSONATE) as session:
+                        await user_custom_logic(session, task_id, task_params, proxy, self.pipeline, self.cpu_pool)
+                    return
+
+                holder = await self.session_pool.acquire()
+                try:
+                    session = await holder.ensure()
+                    holder.used_tasks += 1
+                    await user_custom_logic(session, task_id, task_params, proxy, self.pipeline, self.cpu_pool)
+                finally:
+                    await self.session_pool.release(holder)
             except Exception as e:
                 logger.error(f"Wrapper error: {e}")
 
@@ -585,6 +666,8 @@ class SpiderEngine:
         # 关闭线程池
         self.cpu_pool.shutdown()
         await self.pipeline.stop()
+        if self.session_pool is not None:
+            await self.session_pool.close()
 
 
 async def _poll_fill_loop() -> None:
