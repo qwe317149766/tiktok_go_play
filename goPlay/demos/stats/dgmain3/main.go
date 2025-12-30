@@ -284,6 +284,8 @@ func NewEngine() (*Engine, error) {
 
 	// 初始化设备管理器（用于连续失败阈值触发替换）
 	InitDeviceManager()
+	// 初始化 cookies 管理器（用于连续失败阈值触发替换）
+	InitCookieManager()
 
 	// 初始化设备缓存
 	InitDeviceCache(cacheFile)
@@ -697,6 +699,8 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 	var res string
 	var err error
 	// 执行stats请求 - 添加快速重试（最多2次）
+	var ckID string
+	var ck map[string]string
 	for retry := 0; retry < 2; retry++ {
 		// 尝试次数：每次发起 stats 请求即 +1
 		if shouldLoadDevicesFromRedis() {
@@ -709,7 +713,8 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 					err = fmt.Errorf("panic in Stats3: %v", r)
 				}
 			}()
-			res, err = Stats3(awemeID, seed, seedType, token, device, getCookiesForTask(taskID), signCount, client)
+			ckID, ck = getCookiesForTask(taskID)
+			res, err = Stats3(awemeID, seed, seedType, token, device, ck, signCount, client)
 		}()
 		if err == nil {
 			break
@@ -728,6 +733,10 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 			strings.Contains(errStr, "timeout") ||
 			strings.Contains(errStr, "connection") ||
 			strings.Contains(errStr, "wsarecv")
+		// cookie 连续失败统计（网络错误不计入连续失败）
+		if cm := GetCookieManager(); cm != nil && ckID != "" {
+			cm.RecordFailure(ckID, isNetworkError)
+		}
 		return false, map[string]interface{}{
 			"stage":         "stats",
 			"reason":        errStr,
@@ -740,6 +749,15 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 	}
 
 	success := res != ""
+	// cookie 成功/失败统计：success=false 视为一次“非网络失败”（主要用于风控/被拒）
+	// 注意：Stats3 err!=nil 的情况已在上面 return，这里只有 err==nil。
+	if cm := GetCookieManager(); cm != nil && ckID != "" {
+		if success {
+			cm.RecordSuccess(ckID)
+		} else {
+			cm.RecordFailure(ckID, false)
+		}
+	}
 	// 播放次数：只在成功时 +1
 	if success && shouldLoadDevicesFromRedis() {
 		// 记录 play_count，并返回当前值用于阈值淘汰
@@ -933,10 +951,13 @@ func (e *Engine) Run() {
 				e.bannedDeviceMu.RLock()
 				bannedN := len(e.bannedPoolIDs)
 				e.bannedDeviceMu.RUnlock()
+				// cookies 淘汰统计（连续失败触发替换）
+				ckRepl := getCookieReplacedTotal()
+				ckBanned := getBannedCookieCount()
 
-				log.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%% | 错误分类: seed=%d, token=%d, stats=%d, network=%d, parse=%d, other=%d | 设备淘汰: total=%d (fail=%d, play=%d) banned=%d",
+				log.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%% | 错误分类: seed=%d, token=%d, stats=%d, network=%d, parse=%d, other=%d | 设备淘汰: total=%d (fail=%d, play=%d) banned=%d | Cookies更换: total=%d banned=%d",
 					success, failed, total, rate, seedErr, tokenErr, statsErr, networkErr, parseErr, otherErr,
-					evAll, evFail, evPlay, bannedN)
+					evAll, evFail, evPlay, bannedN, ckRepl, ckBanned)
 				// 动态调整并发数
 				e.adjustConcurrency()
 

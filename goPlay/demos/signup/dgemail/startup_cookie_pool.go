@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 func cookieIDFromMap(cookies map[string]string) string {
@@ -26,12 +28,15 @@ func cookieIDFromMap(cookies map[string]string) string {
 // key 结构：
 // - {prefix}:ids  (SET)
 // - {prefix}:data (HASH) id -> json(cookies map)
-func saveStartupCookiesToRedis(all []RegisterResult) (int, error) {
+func saveStartupCookiesToRedis(all []RegisterResult, targetOverride int) (int, error) {
 	if !getEnvBool("SAVE_STARTUP_COOKIES_TO_REDIS", false) {
 		return 0, nil
 	}
 
-	target := getEnvInt("STARTUP_REGISTER_COUNT", 0)
+	target := targetOverride
+	if target <= 0 {
+		target = getEnvInt("STARTUP_REGISTER_COUNT", 0)
+	}
 	if target <= 0 {
 		// 默认：用 MAX_GENERATE 控制数量（与你统一配置一致）
 		target = getEnvInt("MAX_GENERATE", 0)
@@ -52,6 +57,7 @@ func saveStartupCookiesToRedis(all []RegisterResult) (int, error) {
 	prefix := getEnvStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")
 	idsKey := prefix + ":ids"
 	dataKey := prefix + ":data"
+	useKey := prefix + ":use"
 
 	wrote := 0
 	for _, r := range all {
@@ -64,6 +70,8 @@ func saveStartupCookiesToRedis(all []RegisterResult) (int, error) {
 		pipe := rdb.TxPipeline()
 		pipe.SAdd(ctx, idsKey, id)
 		pipe.HSet(ctx, dataKey, id, string(val))
+		// 初始化 cookies 使用次数（不覆盖已有统计）
+		pipe.ZAddNX(ctx, useKey, redis.Z{Member: id, Score: 0})
 		if _, err := pipe.Exec(ctx); err != nil {
 			return wrote, fmt.Errorf("redis write cookie: %w", err)
 		}

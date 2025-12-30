@@ -615,6 +615,67 @@ func loadStartupCookiesFromRedis(limit int) ([]CookieRecord, error) {
 	return out, nil
 }
 
+// pickOneStartupCookieFromRedis 从 Redis cookie 池里挑一个“未在 exclude 里的 cookies”，用于连续失败后更换。
+func pickOneStartupCookieFromRedis(exclude map[string]bool) (CookieRecord, error) {
+	rdb, err := getRedisClient()
+	if err != nil {
+		return CookieRecord{}, fmt.Errorf("redis init: %w", err)
+	}
+	prefix := envStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")
+	idsKey := prefix + ":ids"
+	dataKey := prefix + ":data"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	var cursor uint64 = 0
+	for i := 0; i < 50; i++ {
+		ids, next, err := rdb.SScan(ctx, idsKey, cursor, "*", 1000).Result()
+		if err != nil {
+			return CookieRecord{}, fmt.Errorf("redis sscan cookie ids: %w", err)
+		}
+		for _, id := range ids {
+			id = strings.TrimSpace(id)
+			if id == "" || id == "default" {
+				continue
+			}
+			if exclude != nil && exclude[id] {
+				continue
+			}
+			raw, err := rdb.HGet(ctx, dataKey, id).Result()
+			if err != nil || strings.TrimSpace(raw) == "" {
+				continue
+			}
+			var ck map[string]string
+			if err := json.Unmarshal([]byte(raw), &ck); err != nil || len(ck) == 0 {
+				continue
+			}
+			return CookieRecord{ID: id, Cookies: ck}, nil
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return CookieRecord{}, fmt.Errorf("no replacement cookie available in redis (all excluded or empty): %s", idsKey)
+}
+
+func incrStartupCookieUseInRedis(cookieID string, delta int64) error {
+	cookieID = strings.TrimSpace(cookieID)
+	if cookieID == "" || cookieID == "default" || delta == 0 {
+		return nil
+	}
+	rdb, err := getRedisClient()
+	if err != nil {
+		return err
+	}
+	prefix := envStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")
+	useKey := prefix + ":use"
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return rdb.ZIncrBy(ctx, useKey, float64(delta), cookieID).Err()
+}
+
 func cookieIDFromMap(cookies map[string]string) string {
 	if v := strings.TrimSpace(cookies["sessionid"]); v != "" {
 		return v

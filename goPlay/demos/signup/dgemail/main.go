@@ -50,6 +50,12 @@ func main() {
 	// 载入 env（优先读取 dgemail 目录或仓库根目录的 env.windows/env.linux）
 	loadEnvForDemo()
 
+	// 轮询补齐模式：检查 Redis cookies 池缺口，自动补齐（Linux 默认开启；Windows 可用 DGEMAIL_POLL_MODE=1 调试）
+	if dgemailPollEnabled() {
+		runCookiePollLoop()
+		return
+	}
+
 	// 确保目录存在
 	os.MkdirAll("data", 0755)
 	os.MkdirAll("res", 0755)
@@ -138,7 +144,7 @@ func main() {
 	saveDevicesWithCookies("res/devices1221/devices12_21_3.txt", devices)
 
 	// 8. （可选）将 startUp 注册成功的 cookies 写入 Redis，供 stats 项目读取
-	if n, err := saveStartupCookiesToRedis(results); err != nil {
+	if n, err := saveStartupCookiesToRedis(results, 0); err != nil {
 		log.Fatalf("写入startUp cookies到Redis失败: %v", err)
 	} else if n > 0 {
 		fmt.Printf("已写入 %d 份 startUp cookies 到 Redis\n", n)

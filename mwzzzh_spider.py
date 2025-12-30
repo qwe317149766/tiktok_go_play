@@ -179,6 +179,9 @@ class RedisDevicePool:
     def ping(self) -> None:
         self.r.ping()
 
+    def count(self) -> int:
+        return int(self.r.scard(self.ids_key))
+
     def _extract_id(self, device: Dict[str, Any]) -> str:
         raw = device.get(self.cfg.id_field)
         if isinstance(raw, str) and raw.strip():
@@ -293,6 +296,24 @@ class Config:
     # - 若未配置，则复用 MAX_GENERATE（与你的设备生成配置保持一致）
     # - 再否则默认 1000
     TASKS = _get_int_from_env("MWZZZH_TASKS", "MAX_GENERATE", default=1000)
+
+    # Linux 轮询补齐模式（设备池补齐）：
+    # - Linux 默认开启；Windows 默认关闭（可用 MWZZZH_POLL_MODE=1 强制开启调试）
+    # - 轮询时，会检查 Redis 设备池当前数量，若少于目标数量，则自动补齐缺口
+    POLL_MODE = _parse_bool(
+        os.getenv("MWZZZH_POLL_MODE"),
+        default=("linux" in platform.system().lower()),
+    )
+    # 轮询间隔（秒）
+    POLL_INTERVAL_SEC = _get_int_from_env("MWZZZH_POLL_INTERVAL_SEC", default=10)
+    # 设备池目标数量：默认取 REDIS_MAX_DEVICES（若未配置则回退 TASKS）
+    REDIS_TARGET_DEVICES = _get_int_from_env(
+        "REDIS_TARGET_DEVICES",
+        "REDIS_MAX_DEVICES",
+        default=TASKS,
+    )
+    # 单轮补齐最大注册数量（避免一次补太多）
+    POLL_BATCH_MAX = _get_int_from_env("MWZZZH_POLL_BATCH_MAX", default=TASKS)
 
 
 # ================= 2. 日志系统 =================
@@ -538,12 +559,14 @@ class SpiderEngine:
             except Exception as e:
                 logger.error(f"Wrapper error: {e}")
 
-    async def run(self):
+    async def run(self, tasks_n: int | None = None):
         await self.pipeline.start()
 
         # 生成任务
-        tasks_data = [{"id": i} for i in range(Config.TASKS)]
-        logger.info(f"开始任务，网络并发: {Config.MAX_CONCURRENCY}, 解析线程: {Config.THREAD_POOL_SIZE}")
+        n = int(tasks_n) if tasks_n is not None else int(Config.TASKS)
+        n = max(0, n)
+        tasks_data = [{"id": i} for i in range(n)]
+        logger.info(f"开始任务，任务数: {n}, 网络并发: {Config.MAX_CONCURRENCY}, 解析线程: {Config.THREAD_POOL_SIZE}")
 
         coroutines = []
         for i, params in enumerate(tasks_data):
@@ -562,6 +585,51 @@ class SpiderEngine:
         # 关闭线程池
         self.cpu_pool.shutdown()
         await self.pipeline.stop()
+
+
+async def _poll_fill_loop() -> None:
+    """
+    轮询补齐模式：
+    - 仅在 SAVE_TO_REDIS=1 时生效
+    - 每隔 POLL_INTERVAL_SEC 秒检查 Redis 设备池数量，若不足目标则补齐
+    """
+    if not Config.SAVE_TO_REDIS:
+        logger.critical("[poll] MWZZZH_POLL_MODE 打开时必须同时打开 SAVE_TO_REDIS=1（需要检查 Redis 设备池数量）")
+        raise SystemExit(1)
+
+    interval = max(1, int(Config.POLL_INTERVAL_SEC))
+    target = max(0, int(Config.REDIS_TARGET_DEVICES))
+    batch_max = max(1, int(Config.POLL_BATCH_MAX))
+
+    if target <= 0:
+        logger.critical("[poll] REDIS_TARGET_DEVICES/REDIS_MAX_DEVICES 需要 > 0")
+        raise SystemExit(1)
+
+    logger.info(f"[poll] 启动：interval={interval}s target={target} batch_max={batch_max}")
+
+    while True:
+        try:
+            # 连接 Redis，读取当前池大小（失败视为致命）
+            rcfg = _get_redis_config(max_devices_default=target)
+            pool = RedisDevicePool(rcfg)
+            pool.ping()
+            cur = pool.count()
+        except Exception as e:
+            logger.critical(f"[poll] Redis 连接/读取失败，程序终止: {e}")
+            raise SystemExit(1)
+
+        missing = target - cur
+        if missing <= 0:
+            logger.info(f"[poll] 设备池充足 cur={cur} target={target}，sleep {interval}s")
+            await asyncio.sleep(interval)
+            continue
+
+        fill_n = min(missing, batch_max)
+        logger.info(f"[poll] 设备池不足 cur={cur} target={target} missing={missing} -> 本轮补齐 {fill_n}")
+
+        engine = SpiderEngine()
+        await engine.run(tasks_n=fill_n)
+        # 本轮跑完立即进入下一轮检查（不额外 sleep）
 
 
 if __name__ == "__main__":
@@ -588,7 +656,10 @@ if __name__ == "__main__":
     if sys.platform.startswith('win'):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    engine = SpiderEngine()
-    asyncio.run(engine.run())
+    if Config.POLL_MODE:
+        asyncio.run(_poll_fill_loop())
+    else:
+        engine = SpiderEngine()
+        asyncio.run(engine.run())
     t1 = time.time()
     print("总耗时===>",t1-t)
