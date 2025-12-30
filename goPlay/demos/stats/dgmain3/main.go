@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -233,6 +234,16 @@ type Engine struct {
 	deviceIndex int64
 	proxyMutex  sync.Mutex
 	deviceMutex sync.Mutex
+	// 设备替换：被淘汰的 poolID 不再回补（本次运行内）
+	bannedDeviceMu sync.RWMutex
+	bannedPoolIDs  map[string]bool
+	// 设备淘汰统计
+	evictedTotal int64
+	evictedFail  int64
+	evictedPlay  int64
+
+	// Linux 抢单模式：成功回调（每次成功播放触发一次，用于更新 Redis/DB 进度）
+	onPlaySuccess func()
 
 	writer        *ResultWriter
 	errorWriter   *ErrorWriter
@@ -271,6 +282,9 @@ func NewEngine() (*Engine, error) {
 	// 初始化代理管理器
 	InitProxyManager(config.Proxies)
 
+	// 初始化设备管理器（用于连续失败阈值触发替换）
+	InitDeviceManager()
+
 	// 初始化设备缓存
 	InitDeviceCache(cacheFile)
 
@@ -279,6 +293,8 @@ func NewEngine() (*Engine, error) {
 		writer:             writer,
 		errorWriter:        errorWriter,
 		proxyManager:       GetProxyManager(),
+		deviceManager:      GetDeviceManager(),
+		bannedPoolIDs:      make(map[string]bool),
 		currentConcurrency: int64(config.MaxConcurrency),
 		minConcurrency:     50,                        // 最小并发数
 		maxConcurrency:     config.MaxConcurrency * 2, // 最大并发数（2倍初始值）
@@ -338,20 +354,103 @@ func (e *Engine) nextProxy() string {
 	return config.Proxies[int(idx)%len(config.Proxies)]
 }
 
-func (e *Engine) nextDevice() string {
+func (e *Engine) nextDevice() (int, string) {
 	e.deviceMutex.Lock()
 	defer e.deviceMutex.Unlock()
 	if len(config.Devices) == 0 {
-		return ""
+		return 0, ""
 	}
 
 	// 简化版本：直接轮询，健康检查在失败时进行
 	idx := atomic.AddInt64(&e.deviceIndex, 1) - 1
-	deviceJSON := config.Devices[int(idx)%len(config.Devices)]
+	slot := int(idx) % len(config.Devices)
+	deviceJSON := config.Devices[slot]
 
 	// 快速提取device_id（只解析一次，不检查健康状态）
 	// 健康检查在taskWrapper失败时进行，避免每次选择都解析JSON
-	return deviceJSON
+	return slot, deviceJSON
+}
+
+func extractPoolIDFromDeviceJSON(deviceJSON string) string {
+	var device map[string]interface{}
+	if err := json.Unmarshal([]byte(deviceJSON), &device); err != nil {
+		return ""
+	}
+	return devicePoolIDFromDevice(device)
+}
+
+func (e *Engine) snapshotActivePoolIDsLocked() map[string]bool {
+	out := make(map[string]bool, len(config.Devices))
+	for _, dj := range config.Devices {
+		pid := extractPoolIDFromDeviceJSON(dj)
+		if strings.TrimSpace(pid) != "" {
+			out[pid] = true
+		}
+	}
+	return out
+}
+
+// replaceBadDeviceIfNeeded：当某个 poolID 连续失败超过阈值时，从 Redis 设备池补一个新设备替换该 slot。
+func (e *Engine) replaceBadDeviceIfNeeded(slot int, deviceJSON string, poolID string) {
+	// 仅 Redis 设备来源才支持动态补位
+	if !shouldLoadDevicesFromRedis() {
+		return
+	}
+	if e.deviceManager == nil {
+		return
+	}
+	if strings.TrimSpace(poolID) == "" {
+		return
+	}
+	// 连续失败阈值：沿用 DeviceManager 的规则（阈值可配置）
+	if e.deviceManager.IsHealthy(poolID) {
+		return
+	}
+
+	e.replaceDevice(slot, deviceJSON, poolID, "consecutive_fail")
+}
+
+func (e *Engine) replaceDevice(slot int, deviceJSON string, poolID string, reason string) {
+	// 加锁替换，保证与 nextDevice 互斥
+	e.deviceMutex.Lock()
+	defer e.deviceMutex.Unlock()
+	// slot 可能越界（理论上不会），防御一下
+	if slot < 0 || slot >= len(config.Devices) {
+		return
+	}
+	// 若 slot 已被其它协程替换过，则不重复操作
+	if config.Devices[slot] != deviceJSON {
+		return
+	}
+
+	// 组装 exclude：当前活跃 + banned
+	exclude := e.snapshotActivePoolIDsLocked()
+	e.bannedDeviceMu.RLock()
+	for k := range e.bannedPoolIDs {
+		exclude[k] = true
+	}
+	e.bannedDeviceMu.RUnlock()
+
+	newPoolID, newJSON, err := pickOneDeviceFromRedis(exclude)
+	if err != nil || strings.TrimSpace(newJSON) == "" || strings.TrimSpace(newPoolID) == "" {
+		return
+	}
+
+	// 替换 slot
+	config.Devices[slot] = newJSON
+	// ban 老的 poolID，避免后续再次被补回来
+	e.bannedDeviceMu.Lock()
+	e.bannedPoolIDs[poolID] = true
+	e.bannedDeviceMu.Unlock()
+
+	// 统计：淘汰次数
+	atomic.AddInt64(&e.evictedTotal, 1)
+	switch reason {
+	case "consecutive_fail":
+		atomic.AddInt64(&e.evictedFail, 1)
+	case "play_max":
+		atomic.AddInt64(&e.evictedPlay, 1)
+	}
 }
 
 // executeTask 执行单个任务 - 优化版本
@@ -643,11 +742,32 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 	success := res != ""
 	// 播放次数：只在成功时 +1
 	if success && shouldLoadDevicesFromRedis() {
-		_ = incrDevicePlay(poolID, 1)
+		// 记录 play_count，并返回当前值用于阈值淘汰
+		if pc, err := incrDevicePlayGet(poolID, 1); err == nil {
+			// 返回给上层用于淘汰判断
+			//（注意：map 的 int64 在 JSON 序列化时会变成 number，不影响）
+			result := map[string]interface{}{
+				"stage":      "stats",
+				"raw":        "",
+				"pool_id":    poolID,
+				"device_id":  deviceID,
+				"play_count": pc,
+			}
+			if len(res) > 2000 {
+				result["raw"] = res[:2000]
+			} else {
+				result["raw"] = res
+			}
+			return true, result
+		} else {
+			_ = incrDevicePlay(poolID, 1) // 降级：尽量不影响主流程
+		}
 	}
 	result := map[string]interface{}{
-		"stage": "stats",
-		"raw":   "",
+		"stage":     "stats",
+		"raw":       "",
+		"pool_id":   poolID,
+		"device_id": deviceID,
 	}
 	if len(res) > 2000 {
 		result["raw"] = res[:2000]
@@ -672,13 +792,15 @@ func (e *Engine) taskWrapper(taskID int) {
 	e.sem <- struct{}{}
 	defer func() { <-e.sem }()
 
-	deviceJSON := e.nextDevice()
+	slot, deviceJSON := e.nextDevice()
 	proxy := e.nextProxy()
 
 	ok, extra := executeTask(taskID, config.AwemeID, deviceJSON, proxy)
 
 	atomic.AddInt64(&e.total, 1)
 	deviceID, _ := extra["device_id"].(string)
+	// 用 poolID 做“设备健康/替换”的主键（与 Redis 设备池一致）
+	poolID := extractPoolIDFromDeviceJSON(deviceJSON)
 
 	if ok {
 		atomic.AddInt64(&e.success, 1)
@@ -688,7 +810,25 @@ func (e *Engine) taskWrapper(taskID int) {
 		}
 		// 记录设备成功
 		if e.deviceManager != nil {
-			e.deviceManager.RecordSuccess(deviceID)
+			e.deviceManager.RecordSuccess(poolID)
+		}
+		if e.onPlaySuccess != nil {
+			e.onPlaySuccess()
+		}
+		// 方式A（维度2）：成功播放达到阈值就淘汰并补位
+		if shouldLoadDevicesFromRedis() && GetDevicePlayMax() > 0 {
+			if v, ok2 := extra["play_count"]; ok2 {
+				switch t := v.(type) {
+				case int64:
+					if t >= GetDevicePlayMax() {
+						e.replaceDevice(slot, deviceJSON, poolID, "play_max")
+					}
+				case float64:
+					if int64(t) >= GetDevicePlayMax() {
+						e.replaceDevice(slot, deviceJSON, poolID, "play_max")
+					}
+				}
+			}
 		}
 		// 成功，不打印日志
 	} else {
@@ -699,8 +839,13 @@ func (e *Engine) taskWrapper(taskID int) {
 		}
 		// 记录设备失败
 		if e.deviceManager != nil {
-			e.deviceManager.RecordFailure(deviceID)
-			// 检查是否连续失败超过10次（静默处理，不打印日志）
+			// 注意：连续失败需要排除网络错误（network_error=true 不累加 ConsecutiveFailures）
+			isNetworkError, _ := extra["network_error"].(bool)
+			e.deviceManager.RecordFailure(poolID, isNetworkError)
+			// 方式A：仅在“非网络错误导致的连续失败”达到阈值后动态补位
+			if !isNetworkError {
+				e.replaceBadDeviceIfNeeded(slot, deviceJSON, poolID)
+			}
 		}
 
 		// 分类统计错误
@@ -781,8 +926,17 @@ func (e *Engine) Run() {
 				networkErr := atomic.LoadInt64(&e.errorStats.NetworkErrors)
 				parseErr := atomic.LoadInt64(&e.errorStats.ParseErrors)
 				otherErr := atomic.LoadInt64(&e.errorStats.OtherErrors)
-				log.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%% | 错误分类: seed=%d, token=%d, stats=%d, network=%d, parse=%d, other=%d",
-					success, failed, total, rate, seedErr, tokenErr, statsErr, networkErr, parseErr, otherErr)
+				// 设备淘汰统计（方式A）
+				evAll := atomic.LoadInt64(&e.evictedTotal)
+				evFail := atomic.LoadInt64(&e.evictedFail)
+				evPlay := atomic.LoadInt64(&e.evictedPlay)
+				e.bannedDeviceMu.RLock()
+				bannedN := len(e.bannedPoolIDs)
+				e.bannedDeviceMu.RUnlock()
+
+				log.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%% | 错误分类: seed=%d, token=%d, stats=%d, network=%d, parse=%d, other=%d | 设备淘汰: total=%d (fail=%d, play=%d) banned=%d",
+					success, failed, total, rate, seedErr, tokenErr, statsErr, networkErr, parseErr, otherErr,
+					evAll, evFail, evPlay, bannedN)
 				// 动态调整并发数
 				e.adjustConcurrency()
 
@@ -886,7 +1040,18 @@ func main() {
 	rand.Seed(time.Now().UnixNano())
 	loadEnvForDemo()
 
-	proxiesPath := "proxies.txt"
+	// 并发数：从 env 读取（统一配置）
+	// 优先级：STATS_CONCURRENCY > GEN_CONCURRENCY > 代码默认值
+	if v := envInt("STATS_CONCURRENCY", 0); v > 0 {
+		config.MaxConcurrency = v
+	} else if v := envInt("GEN_CONCURRENCY", 0); v > 0 {
+		config.MaxConcurrency = v
+	}
+
+	proxiesPath := findTopmostFileUpwards("proxies.txt", 8)
+	if proxiesPath == "" {
+		proxiesPath = "proxies.txt"
+	}
 	devicesPath := "devices.txt"
 
 	// 加载代理
@@ -900,20 +1065,28 @@ func main() {
 		}
 		fmt.Printf("已加载 %d 个代理\n", len(config.Proxies))
 	} else {
-		fmt.Printf("缺少 proxies.txt: %v\n", err)
+		fmt.Printf("缺少 proxies.txt（请在仓库根目录放 proxies.txt）: %v\n", err)
 		os.Exit(1)
 	}
 
 	// 加载设备：优先从 Python 注册成功写入的 Redis 设备池读取
 	if shouldLoadDevicesFromRedis() {
-		limit := envInt("DEVICES_LIMIT", envInt("MAX_GENERATE", 0))
-		devs, err := loadDevicesFromRedis(limit)
+		// Redis 模式：用多少取多少
+		// 默认按并发数取设备（例如并发 1000 就先取 1000 个），设备淘汰时再从 Redis 补位。
+		need := envInt("DEVICES_LIMIT", 0)
+		if need <= 0 {
+			need = config.MaxConcurrency
+		}
+		if need <= 0 {
+			need = 1
+		}
+		devs, err := loadDevicesFromRedisN(need)
 		if err != nil {
 			fmt.Printf("从Redis读取设备失败: %v\n", err)
 			os.Exit(1)
 		}
 		config.Devices = append(config.Devices, devs...)
-		fmt.Printf("已从Redis加载 %d 个设备\n", len(config.Devices))
+		fmt.Printf("已从Redis加载 %d 个设备（按需加载，目标=%d）\n", len(config.Devices), need)
 	} else {
 		// 兼容旧逻辑：读本地文件（如果不存在则自动生成）
 		if data, err := ioutil.ReadFile(devicesPath); err == nil {
@@ -964,7 +1137,18 @@ func main() {
 		globalCookiePool = cookies
 		fmt.Printf("已从Redis加载 %d 份 startUp cookies\n", len(globalCookiePool))
 	} else {
-		fmt.Printf("未启用 COOKIES_FROM_REDIS/COOKIES_SOURCE=redis，将继续使用 stats.go 的空 cookies（通常会失败）\n")
+		fmt.Printf("未启用 COOKIES_SOURCE=redis（COOKIES_FROM_REDIS 为旧兼容写法），将继续使用 stats.go 的空 cookies（通常会失败）\n")
+	}
+
+	// Linux 抢单模式：从数据库抢未完成订单，按订单 aweme_id 执行播放，并实时写 Redis/回写数据库
+	if shouldRunOrderMode() {
+		runOrderMode()
+		return
+	}
+
+	// Windows/非抢单模式：视频 ID 从配置文件读取
+	if aweme := strings.TrimSpace(envStr("AWEME_ID", "")); aweme != "" {
+		config.AwemeID = aweme
 	}
 
 	engine, err := NewEngine()
@@ -973,4 +1157,28 @@ func main() {
 	}
 	engine.Run()
 	// 总耗时已在Run()方法中打印
+}
+
+// findTopmostFileUpwards 从当前目录开始向上查找文件，返回“最顶层”的那个路径（更接近仓库根目录）。
+func findTopmostFileUpwards(name string, maxUp int) string {
+	start, err := os.Getwd()
+	if err != nil || start == "" {
+		return ""
+	}
+	start, _ = filepath.Abs(start)
+
+	found := ""
+	dir := start
+	for i := 0; i <= maxUp; i++ {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			found = p
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return found
 }

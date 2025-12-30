@@ -10,6 +10,7 @@ from itertools import cycle
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any
 from dataclasses import dataclass
+from pathlib import Path
 
 # 你的核心请求库
 from curl_cffi.requests import AsyncSession
@@ -276,6 +277,17 @@ class Config:
 
     # 是否保存“注册成功设备”到 Redis
     SAVE_TO_REDIS = _parse_bool(os.getenv("SAVE_TO_REDIS"), False)
+
+    # 是否把“注册成功设备”写入本地备份文件（10 个文件，均分；追加写入）
+    # 复用你已有的 SAVE_TO_FILE / PER_FILE_MAX 配置（与 generate_devices_bulk.py 一致）
+    SAVE_TO_FILE = _parse_bool(os.getenv("SAVE_TO_FILE"), False)
+    FILE_BACKUP_DIR = os.getenv("DEVICE_BACKUP_DIR", "device_backups")
+    FILE_PREFIX = os.getenv("DEVICE_FILE_PREFIX", "devices")
+    PER_FILE_MAX = _get_int_from_env("PER_FILE_MAX", default=10000)
+
+    # 本地备份分片数：默认等于“线程数”（THREAD_POOL_SIZE）
+    # 你的诉求：根据线程数写入，每个线程写自己的 => 用 task_id % FILE_SHARDS 分流到不同文件
+    FILE_SHARDS = _get_int_from_env("DEVICE_FILE_SHARDS", default=THREAD_POOL_SIZE)
     # 任务数量：
     # - 优先 MWZZZH_TASKS
     # - 若未配置，则复用 MAX_GENERATE（与你的设备生成配置保持一致）
@@ -300,39 +312,112 @@ logger.addHandler(fh)
 
 # ================= 3. 数据管道 (保持不变) =================
 class DataPipeline:
-    def __init__(self, filename, redis_pool: RedisDevicePool | None = None):
+    def __init__(self, filename, redis_pool: RedisDevicePool | None = None, save_to_file: bool = False):
         self.filename = filename
         self.queue = asyncio.Queue()
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.running = True
         self._writer_task = None
         self.redis_pool = redis_pool
+        self.save_to_file = save_to_file
+
+        # 本地备份：按“线程数/分片数”写多个文件（每个分片一个文件）
+        self._file_fps = None
+        self._file_counts = None
+        self._file_paths = None
+
+    def _init_file_backup(self) -> None:
+        if self._file_fps is not None:
+            return
+
+        out_dir = Path(Config.FILE_BACKUP_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        file_count = max(1, int(Config.FILE_SHARDS))
+        paths = [out_dir / f"{Config.FILE_PREFIX}_{i}.txt" for i in range(file_count)]
+
+        # 记录每个文件当前行数（仅用于可观测性；不会因为 PER_FILE_MAX 满了就停止写入）
+        counts = [0] * file_count
+        if Config.PER_FILE_MAX and Config.PER_FILE_MAX > 0:
+            for i, p in enumerate(paths):
+                if p.exists():
+                    try:
+                        with p.open("r", encoding="utf-8", errors="ignore") as rf:
+                            counts[i] = sum(1 for _ in rf)
+                    except Exception:
+                        counts[i] = 0
+
+        fps = [p.open("a", encoding="utf-8") for p in paths]
+        self._file_paths = paths
+        self._file_counts = counts
+        self._file_fps = fps
+        logger.info(
+            f"[file] 启用成功 out_dir={out_dir} prefix={Config.FILE_PREFIX} "
+            f"per_file_max={Config.PER_FILE_MAX} (files={file_count}, shard=task_id%{file_count}, 满了也会继续追加写入)"
+        )
+
+    def _write_devices_to_backup_files(self, batch: list[tuple[int | None, Dict[str, Any]]]) -> None:
+        if not self.save_to_file:
+            return
+
+        self._init_file_backup()
+        assert self._file_fps is not None and self._file_counts is not None
+
+        file_count = len(self._file_fps)
+
+        for shard_key, dev in batch:
+            # 每个“线程槽位/worker”写自己的文件：idx = shard_key % file_count
+            # shard_key 取 task_id（由上层传入）
+            if shard_key is None:
+                fidx = 0
+            else:
+                fidx = int(shard_key) % file_count
+
+            line = json.dumps(dev, ensure_ascii=False, separators=(",", ":"))
+            self._file_fps[fidx].write(line + "\n")
+            self._file_counts[fidx] += 1
+
+        # 尽量及时刷盘（备份用途）
+        for fp in self._file_fps:
+            fp.flush()
 
     async def start(self):
         self._writer_task = asyncio.create_task(self._consumer())
 
-    async def save(self, data: Dict):
-        await self.queue.put(data)
+    async def save(self, data: Dict, shard_key: int | None = None):
+        # shard_key：用于本地备份分片（建议传 task_id）
+        await self.queue.put((shard_key, data))
 
     def _write_impl(self, batch):
         try:
             with open(self.filename, 'a', encoding='utf-8') as f:
-                for item in batch:
+                for _, item in batch:
                     line = json.dumps(item, ensure_ascii=False)
                     f.write(line + "\n")
         except Exception as e:
             logger.error(f"写入失败: {e}")
+            # results 文件都写不进去时，直接抛给上层（让线程退出）
+            raise
+
+        # 同步写入本地备份文件（在 executor 线程中执行）
+        try:
+            self._write_devices_to_backup_files(batch)
+        except Exception as e:
+            logger.critical(f"[file] 致命：写入本地备份失败: {e}")
+            # 备份打开时：视为致命，避免“跑了但没落地”
+            raise
 
         # 同步写入 Redis（在 executor 线程中执行，不阻塞 event loop）
         if self.redis_pool is not None:
             # Redis 打开时：任何写入失败都应该终止程序（避免“跑了但没入库”）
-            _, evicted = self.redis_pool.add_devices(batch)
+            only_devices = [d for _, d in batch]
+            _, evicted = self.redis_pool.add_devices(only_devices)
             if evicted:
                 # 不刷屏，只在发生淘汰时提示一次
                 logger.info(f"[redis] 设备池已满，已淘汰 {evicted} 条（按 use_count 最大）")
 
     async def _consumer(self):
-        batch = []
+        batch: list[tuple[int | None, Dict[str, Any]]] = []
         while self.running or not self.queue.empty():
             try:
                 item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
@@ -349,8 +434,8 @@ class DataPipeline:
                     )
                 except Exception as e:
                     # 如果开启了 Redis，这里视为致命错误：立即退出
-                    if self.redis_pool is not None:
-                        logger.critical(f"[redis] 致命：写入失败，程序终止: {e}")
+                    if self.redis_pool is not None or self.save_to_file:
+                        logger.critical(f"[pipeline] 致命：写入失败，程序终止: {e}")
                         os._exit(1)
                     # 未开启 Redis：保留原行为，只记录错误继续
                     logger.error(f"写入线程异常: {e}")
@@ -360,6 +445,13 @@ class DataPipeline:
         await self.queue.join()
         await self._writer_task
         self.executor.shutdown()
+        # 关闭本地备份文件句柄
+        if self._file_fps is not None:
+            try:
+                for fp in self._file_fps:
+                    fp.close()
+            except Exception:
+                pass
 
 
 # ================= 4. 核心：同步解析逻辑 (在线程中运行) =================
@@ -400,7 +492,8 @@ async def user_custom_logic(task_id, task_params, proxy, pipeline, thread_pool):
             # 直接把 thread_pool 传给业务层
             device1 = await run_registration_flow(session, proxy, thread_pool, task_id)
             if type(device1)==dict:
-                await pipeline.save(device1)
+                # 传 task_id 用于“按线程数分片写文件”：idx = task_id % FILE_SHARDS
+                await pipeline.save(device1, shard_key=task_id)
                 logger.info(f"[{task_id}] 注册成功")
             else:
                 logger.warning(f"[{task_id}] 注册失败 (返回 None),{device1}")
@@ -427,7 +520,7 @@ class SpiderEngine:
                 logger.critical(f"[redis] 启用失败，程序终止: {e}")
                 raise SystemExit(1)
 
-        self.pipeline = DataPipeline(Config.RESULT_FILE, redis_pool=redis_pool)
+        self.pipeline = DataPipeline(Config.RESULT_FILE, redis_pool=redis_pool, save_to_file=Config.SAVE_TO_FILE)
         self.sem = asyncio.Semaphore(Config.MAX_CONCURRENCY)
 
         # 【新增】计算型线程池

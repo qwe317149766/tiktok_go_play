@@ -38,7 +38,8 @@ test3@gmail.com:password789
 
 需要在环境变量或 `env.windows/env.linux` 中配置（会自动尝试加载）：
 
-- `DEVICES_FROM_REDIS=1` 或 `DEVICES_SOURCE=redis`
+- 推荐：`DEVICES_SOURCE=redis`
+- 兼容旧配置：`DEVICES_FROM_REDIS=1`（不推荐，仅兼容）
 - `DEVICES_LIMIT`（可选；默认取 `MAX_GENERATE`，不填则读取全部）
 - Redis 连接参数：`REDIS_URL` 或 `REDIS_HOST/REDIS_PORT/REDIS_DB/...`
 - `REDIS_DEVICE_POOL_KEY`（与 Python 一致，默认 `tiktok:device_pool`）
@@ -51,6 +52,8 @@ socks5h://proxy1:port@host:port
 socks5h://proxy2:port@host:port
 http://proxy3:port
 ```
+
+> 说明：当前版本会优先读取“仓库根目录”的 `proxies.txt`（从当前目录向上查找，取最顶层那个），用于所有项目统一代理配置。
 
 ### 2. 编译运行
 

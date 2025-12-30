@@ -264,6 +264,28 @@ func incrDevicePlay(poolID string, delta int64) error {
 	return rdb.ZIncrBy(ctx, playKey, float64(delta), poolID).Err()
 }
 
+// incrDevicePlayGet 写“播放次数”（play_count）并返回写入后的计数（用于达到阈值淘汰）。
+func incrDevicePlayGet(poolID string, delta int64) (int64, error) {
+	if strings.TrimSpace(poolID) == "" {
+		return 0, fmt.Errorf("empty poolID")
+	}
+	rdb, err := getRedisClient()
+	if err != nil {
+		return 0, err
+	}
+	_, playKey := devicePoolCountKeys()
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	v, err := rdb.ZIncrBy(ctx, playKey, float64(delta), poolID).Result()
+	if err != nil {
+		return 0, err
+	}
+	if v < 0 {
+		return 0, nil
+	}
+	return int64(v), nil
+}
+
 func incrDeviceFail(poolID string, delta int64) error {
 	if strings.TrimSpace(poolID) == "" {
 		return fmt.Errorf("empty poolID")
@@ -332,6 +354,119 @@ func loadDevicesFromRedis(limit int) ([]string, error) {
 	return out, nil
 }
 
+// loadDevicesFromRedisN 用于“按需取用”：
+// - Redis 模式下不再一次性加载全量设备，而是启动时按需要数量（通常等于并发数）拉取 N 个设备到内存。
+// - 会持续扫描 ids，直到拿到 N 条有效 data 或扫完为止。
+func loadDevicesFromRedisN(target int) ([]string, error) {
+	if target <= 0 {
+		return []string{}, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	rdb, err := getRedisClient()
+	if err != nil {
+		return nil, fmt.Errorf("redis init: %w", err)
+	}
+
+	prefix := envStr("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool")
+	idsKey := prefix + ":ids"
+	dataKey := prefix + ":data"
+
+	out := make([]string, 0, target)
+	seen := make(map[string]bool, target)
+
+	var cursor uint64 = 0
+	for page := 0; page < 200; page++ { // 上限保护：最多扫 200 页
+		ids, next, err := rdb.SScan(ctx, idsKey, cursor, "*", 1000).Result()
+		if err != nil {
+			return nil, fmt.Errorf("redis sscan ids: %w", err)
+		}
+		cursor = next
+
+		// 筛选本页候选
+		fields := make([]string, 0, len(ids))
+		for _, id := range ids {
+			id = strings.TrimSpace(id)
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			fields = append(fields, id)
+		}
+		if len(fields) > 0 {
+			vals, err := rdb.HMGet(ctx, dataKey, fields...).Result()
+			if err != nil {
+				return nil, fmt.Errorf("redis hmget data: %w", err)
+			}
+			for _, v := range vals {
+				s, ok := v.(string)
+				if !ok || strings.TrimSpace(s) == "" {
+					continue
+				}
+				out = append(out, s)
+				if len(out) >= target {
+					return out, nil
+				}
+			}
+		}
+
+		if cursor == 0 {
+			break
+		}
+	}
+
+	if len(out) == 0 {
+		return nil, fmt.Errorf("redis device pool empty or no valid data: %s", idsKey)
+	}
+	return out, nil
+}
+
+// pickOneDeviceFromRedis 从 Redis 设备池里挑一个“未在 exclude 里的设备”，用于坏设备补位。
+// 返回：(poolID, deviceJSON)
+func pickOneDeviceFromRedis(exclude map[string]bool) (string, string, error) {
+	rdb, err := getRedisClient()
+	if err != nil {
+		return "", "", fmt.Errorf("redis init: %w", err)
+	}
+
+	prefix := envStr("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool")
+	idsKey := prefix + ":ids"
+	dataKey := prefix + ":data"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	var cursor uint64 = 0
+	// 最多扫 50 页，避免极端情况下无限循环
+	for i := 0; i < 50; i++ {
+		ids, next, err := rdb.SScan(ctx, idsKey, cursor, "*", 1000).Result()
+		if err != nil {
+			return "", "", fmt.Errorf("redis sscan ids: %w", err)
+		}
+		for _, id := range ids {
+			if strings.TrimSpace(id) == "" {
+				continue
+			}
+			if exclude != nil && exclude[id] {
+				continue
+			}
+			raw, err := rdb.HGet(ctx, dataKey, id).Result()
+			if err != nil || strings.TrimSpace(raw) == "" {
+				continue
+			}
+			return id, raw, nil
+		}
+
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return "", "", fmt.Errorf("no replacement device available in redis (all excluded or empty): %s", idsKey)
+}
+
 // -------- startup cookie pool (来自 Go startUp 注册写入) --------
 
 func shouldLoadCookiesFromRedis() bool {
@@ -374,7 +509,19 @@ func loadStartupCookiesFromRedis(limit int) ([]CookieRecord, error) {
 		return nil, fmt.Errorf("redis sscan cookie ids: %w", err)
 	}
 	if len(ids) == 0 {
-		return nil, fmt.Errorf("redis startup cookie pool empty: %s", idsKey)
+		// 兜底：如果 Redis cookie 池为空，允许使用默认 cookies（通过 env 提供）
+		// DEFAULT_COOKIES_JSON 格式：{"sessionid":"...","sid_tt":"...","uid_tt":"...", ...}
+		if raw := strings.TrimSpace(os.Getenv("DEFAULT_COOKIES_JSON")); raw != "" {
+			var ck map[string]string
+			if err := json.Unmarshal([]byte(raw), &ck); err == nil && len(ck) > 0 {
+				return []CookieRecord{{ID: "default", Cookies: ck}}, nil
+			}
+			return nil, fmt.Errorf("redis startup cookie pool empty: %s；DEFAULT_COOKIES_JSON 解析失败或为空", idsKey)
+		}
+		return nil, fmt.Errorf(
+			"redis startup cookie pool empty: %s；请先运行 goPlay/demos/signup/dgemail 产出 cookies 并写入 Redis，或配置 DEFAULT_COOKIES_JSON 作为兜底",
+			idsKey,
+		)
 	}
 
 	const chunk = 500
@@ -417,6 +564,84 @@ func cookieIDFromMap(cookies map[string]string) string {
 	b, _ := json.Marshal(cookies)
 	h := sha1.Sum(b)
 	return hex.EncodeToString(h[:])
+}
+
+// -------- order progress (Linux 抢单模式：实时写 Redis) --------
+
+func orderProgressKey(orderID string) string {
+	prefix := envStr("REDIS_ORDER_PROGRESS_PREFIX", "tiktok:order_progress")
+	return prefix + ":" + strings.TrimSpace(orderID)
+}
+
+// incrOrderDeliveredInRedis 实时更新 Redis 中订单完成量（worker 每成功一次就 +1）。
+// 结构：HSET {prefix}:{order_id} delivered/total/updated_at
+func incrOrderDeliveredInRedis(orderID string, delta int64, total int64) error {
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" || delta <= 0 {
+		return nil
+	}
+	rdb, err := getRedisClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	key := orderProgressKey(orderID)
+	pipe := rdb.Pipeline()
+	pipe.HSetNX(ctx, key, "total", total)
+	pipe.HIncrBy(ctx, key, "delivered", delta)
+	pipe.HSet(ctx, key, "updated_at", time.Now().Unix())
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+func getOrderDeliveredFromRedis(orderID string) (delivered int64, total int64, ok bool, err error) {
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		return 0, 0, false, nil
+	}
+	rdb, err := getRedisClient()
+	if err != nil {
+		return 0, 0, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	key := orderProgressKey(orderID)
+	m, err := rdb.HGetAll(ctx, key).Result()
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if len(m) == 0 {
+		return 0, 0, false, nil
+	}
+	ok = true
+	if v, ok2 := m["delivered"]; ok2 {
+		if n, err2 := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err2 == nil {
+			delivered = n
+		}
+	}
+	if v, ok2 := m["total"]; ok2 {
+		if n, err2 := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err2 == nil {
+			total = n
+		}
+	}
+	return delivered, total, ok, nil
+}
+
+func deleteOrderProgressInRedis(orderID string) error {
+	orderID = strings.TrimSpace(orderID)
+	if orderID == "" {
+		return nil
+	}
+	rdb, err := getRedisClient()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return rdb.Del(ctx, orderProgressKey(orderID)).Err()
 }
 
 

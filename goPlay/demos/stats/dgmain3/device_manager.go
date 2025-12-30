@@ -1,6 +1,8 @@
 package main
 
 import (
+	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 )
@@ -20,14 +22,42 @@ type DeviceManager struct {
 
 var globalDeviceManager *DeviceManager
 var deviceManagerOnce sync.Once
+var deviceFailThreshold int64 = 10
+var devicePlayMax int64 = 0
 
 // InitDeviceManager 初始化设备管理器
 func InitDeviceManager() {
 	deviceManagerOnce.Do(func() {
+		// 连续失败阈值：从 env 读取（默认 10）
+		// 优先级：STATS_DEVICE_FAIL_THRESHOLD > DEVICE_FAIL_THRESHOLD > 默认值
+		deviceFailThreshold = readEnvInt64("STATS_DEVICE_FAIL_THRESHOLD", readEnvInt64("DEVICE_FAIL_THRESHOLD", 10))
+		// 成功播放次数上限：达到后淘汰（默认 0 表示不启用）
+		// 优先级：STATS_DEVICE_PLAY_MAX > DEVICE_PLAY_MAX > 默认值
+		devicePlayMax = readEnvInt64("STATS_DEVICE_PLAY_MAX", readEnvInt64("DEVICE_PLAY_MAX", 0))
 		globalDeviceManager = &DeviceManager{
 			stats: make(map[string]*DeviceStats),
 		}
 	})
+}
+
+func readEnvInt64(name string, def int64) int64 {
+	v := os.Getenv(name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
+}
+
+func GetDeviceFailThreshold() int64 {
+	return deviceFailThreshold
+}
+
+func GetDevicePlayMax() int64 {
+	return devicePlayMax
 }
 
 // GetDeviceManager 获取全局设备管理器
@@ -55,7 +85,8 @@ func (dm *DeviceManager) RecordSuccess(deviceID string) {
 }
 
 // RecordFailure 记录设备失败
-func (dm *DeviceManager) RecordFailure(deviceID string) {
+// - 网络错误不计入连续失败（避免短期网络抖动把设备误判为坏）
+func (dm *DeviceManager) RecordFailure(deviceID string, isNetworkError bool) {
 	if deviceID == "" || deviceID == "unknown" {
 		return
 	}
@@ -70,10 +101,12 @@ func (dm *DeviceManager) RecordFailure(deviceID string) {
 	}
 	
 	atomic.AddInt64(&stat.TotalFailed, 1)
-	atomic.AddInt64(&stat.ConsecutiveFailures, 1)
+	if !isNetworkError {
+		atomic.AddInt64(&stat.ConsecutiveFailures, 1)
+	}
 }
 
-// IsHealthy 检查设备是否健康（连续失败次数不超过10次）
+// IsHealthy 检查设备是否健康（连续失败次数不超过阈值）
 func (dm *DeviceManager) IsHealthy(deviceID string) bool {
 	if deviceID == "" || deviceID == "unknown" {
 		return true // 未知设备默认认为健康
@@ -88,7 +121,7 @@ func (dm *DeviceManager) IsHealthy(deviceID string) bool {
 	}
 	
 	consecutiveFailures := atomic.LoadInt64(&stat.ConsecutiveFailures)
-	return consecutiveFailures < 10 // 连续失败10次以上认为不健康
+	return consecutiveFailures < deviceFailThreshold // 连续失败达到阈值认为不健康
 }
 
 // GetDeviceStats 获取设备统计信息

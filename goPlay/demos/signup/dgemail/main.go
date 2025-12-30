@@ -7,6 +7,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,7 +102,12 @@ func main() {
 	}
 
 	// 3. 读取代理列表
-	proxies, err := loadProxies("data/proxies.txt")
+	proxyPath := findTopmostFileUpwards("proxies.txt", 8)
+	if proxyPath == "" {
+		// 兼容旧目录结构
+		proxyPath = "data/proxies.txt"
+	}
+	proxies, err := loadProxies(proxyPath)
 	if err != nil {
 		log.Fatalf("读取代理列表失败: %v", err)
 	}
@@ -294,6 +300,31 @@ func loadProxies(filename string) ([]string, error) {
 	}
 
 	return proxies, scanner.Err()
+}
+
+// findTopmostFileUpwards 从当前目录开始向上查找文件，返回“最顶层”的那个路径（更接近仓库根目录）。
+// 例如：希望所有项目统一使用仓库根目录的 proxies.txt。
+func findTopmostFileUpwards(name string, maxUp int) string {
+	start, err := os.Getwd()
+	if err != nil || start == "" {
+		return ""
+	}
+	start, _ = filepath.Abs(start)
+
+	found := ""
+	dir := start
+	for i := 0; i <= maxUp; i++ {
+		p := filepath.Join(dir, name)
+		if _, err := os.Stat(p); err == nil {
+			found = p
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return found
 }
 
 // registerAccounts 并发注册账号
