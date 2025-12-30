@@ -33,6 +33,16 @@ test3@gmail.com:password789
 {"device_id":"7584765107970262542","install_id":"7584766379061888783","ua":"...","openudid":"...","cdid":"...","device_guard_data0":"..."}
 ```
 
+#### （可选）从 Redis 读取设备（推荐：复用 Python 注册成功写入的设备池）
+当你已经用 Python 注册流程把成功设备写入 Redis 后，可让本 Go demo 直接从 Redis 读取，不再依赖 `devices.txt`。
+
+需要在环境变量或 `env.windows/env.linux` 中配置（会自动尝试加载）：
+
+- `DEVICES_FROM_REDIS=1` 或 `DEVICES_SOURCE=redis`
+- `DEVICES_LIMIT`（可选；默认取 `MAX_GENERATE`，不填则读取全部）
+- Redis 连接参数：`REDIS_URL` 或 `REDIS_HOST/REDIS_PORT/REDIS_DB/...`
+- `REDIS_DEVICE_POOL_KEY`（与 Python 一致，默认 `tiktok:device_pool`）
+
 #### `proxies.txt` - 代理列表
 格式：每行一个代理地址
 

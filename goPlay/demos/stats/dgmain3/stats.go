@@ -27,7 +27,7 @@ func initRand() {
 }
 
 // Stats3 发送 TikTok stats 请求 - 高性能版本
-func Stats3(awemeID, seed string, seedType int, token string, device map[string]interface{}, signCount int, client *http.Client) (string, error) {
+func Stats3(awemeID, seed string, seedType int, token string, device map[string]interface{}, cookies map[string]string, signCount int, client *http.Client) (string, error) {
 	initRand()
 
 	// 从 device map 中提取参数
@@ -143,24 +143,10 @@ func Stats3(awemeID, seed string, seedType int, token string, device map[string]
 	reqHeaders["tt-device-guard-public-key"] = deviceHeaders["tt-ticket-guard-public-key"]
 	reqHeaders["tt-device-guard-client-data"] = deviceHeaders["tt-device-guard-client-data"]
 
-	// 构建 cookies
-	cookies := map[string]string{
-		"odin_tt":                "e4884aea302114ac728100cc88d1f9d3af080d05e9c58731960bc41eca48ca85c391cd06899a5b509ebdfce2a4c8b9ce54a2e51d1c0057e72875d3a11b0008e2b353f1a7f93b0db51c77622cf1b7a33f",
-		"multi_sids":             "7583182918605390861%3A4e7e319319093d1c1d0f32dcd3393adc",
-		"cmpl_token":             "AgQQAPNSF-RPsLkCDghqeh0080kaQNpcf4zZYKKbSg",
-		"sid_guard":              "4e7e319319093d1c1d0f32dcd3393adc%7C1765597373%7C15551999%7CThu%2C+11-Jun-2026+03%3A42%3A52+GMT",
-		"uid_tt":                 "d49cfea57c8d44204588e4ef83e7deab41df8a477ff57e72694779305c643afb",
-		"uid_tt_ss":              "d49cfea57c8d44204588e4ef83e7deab41df8a477ff57e72694779305c643afb",
-		"sid_tt":                 "4e7e319319093d1c1d0f32dcd3393adc",
-		"sessionid":              "4e7e319319093d1c1d0f32dcd3393adc",
-		"sessionid_ss":           "4e7e319319093d1c1d0f32dcd3393adc",
-		"tt_session_tlb_tag":     "sttt%7C4%7CTn4xkxkJPRwdDzLc0zk63P_________-qGY94XseCxHOGykQhl5VO4sHCzDVMwoLAH1Rrst6xBc%3D",
-		"reg-store-region":        "",
-		"store-idc":              "useast5",
-		"store-country-sign":     "MEIEDAB3ch3TdCLVxiVl1wQg_xJqt8zDpA9lkGHz761BZtW-Uh8bz91S_CCbh2Vz4QgEEBZowwBKgA8GgQP2Y_Bkzw8",
-		"store-country-code":     "us",
-		"store-country-code-src": "uid",
-		"tt-target-idc":          "useast5",
+	// cookies 必须来自 Go startUp 注册写入的 redis cookie 池。
+	// 为了兼容老代码，这里允许 cookies 为空（将导致无 cookie 请求，通常会失败）。
+	if cookies == nil {
+		cookies = map[string]string{}
 	}
 
 	// 创建请求

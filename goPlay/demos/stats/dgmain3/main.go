@@ -375,6 +375,9 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 		deviceID = fmt.Sprintf("%.0f", id)
 	}
 
+	// Redis 设备池 ID（与 Python 写入的 key 保持一致）
+	poolID := devicePoolIDFromDevice(device)
+
 	// 转换device
 	deviceMap := make(map[string]string)
 	for k, v := range device {
@@ -395,15 +398,21 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 	var seedType int
 	var token string
 
-	// 检查缓存
-	cache := GetDeviceCache()
-	if cacheInfo, exists := cache.Get(deviceID); exists {
-		// 使用缓存的数据
-		seed = cacheInfo.Seed
-		seedType = cacheInfo.SeedType
-		token = cacheInfo.Token
-		// 使用缓存，不打印日志
+	// 检查缓存（如果设备来自 Redis，则直接读/写 Redis，确保“缓存更新到 Python 注册设备信息”）
+	if shouldLoadDevicesFromRedis() {
+		if s, st, t, ok := getSeedTokenFromRedis(poolID); ok {
+			seed, seedType, token = s, st, t
+		}
 	} else {
+		cache := GetDeviceCache()
+		if cacheInfo, exists := cache.Get(deviceID); exists {
+			seed = cacheInfo.Seed
+			seedType = cacheInfo.SeedType
+			token = cacheInfo.Token
+		}
+	}
+
+	if seed == "" || token == "" || seedType == 0 {
 		// 缓存不存在，需要请求
 		// 获取HTTP客户端（使用代理管理器）
 		var client *http.Client
@@ -544,17 +553,36 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 		}
 
 		if token == "" {
+			// token 获取失败也算一次失败使用
+			if shouldLoadDevicesFromRedis() {
+				_ = incrDeviceFail(poolID, 1)
+			}
 			return false, map[string]interface{}{
 				"stage":     "token",
 				"reason":    "empty token after retries",
 				"task_id":   taskID,
 				"proxy":     proxy,
 				"device_id": deviceID,
+				"pool_id":   poolID,
 			}
 		}
 
-		// 保存到缓存（静默保存，不打印日志）
-		cache.Set(deviceID, seed, seedType, token)
+		// 保存到缓存（Redis 模式：写回 Python 注册设备信息；文件模式：沿用 device_cache.txt）
+		if shouldLoadDevicesFromRedis() {
+			if err := setSeedTokenToRedis(poolID, seed, seedType, token); err != nil {
+				return false, map[string]interface{}{
+					"stage":     "cache",
+					"reason":    fmt.Sprintf("write seed/token to redis failed: %v", err),
+					"task_id":   taskID,
+					"proxy":     proxy,
+					"device_id": deviceID,
+					"pool_id":   poolID,
+				}
+			}
+		} else {
+			cache := GetDeviceCache()
+			cache.Set(deviceID, seed, seedType, token)
+		}
 	}
 
 	// 执行stats请求 - 添加快速重试（最多2次）
@@ -571,6 +599,10 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 	var err error
 	// 执行stats请求 - 添加快速重试（最多2次）
 	for retry := 0; retry < 2; retry++ {
+		// 播放次数（use_count）与设备使用次数统一：每次发起 stats 请求即 +1
+		if shouldLoadDevicesFromRedis() {
+			_ = incrDeviceUse(poolID, 1)
+		}
 		// 使用defer recover来捕获panic
 		func() {
 			defer func() {
@@ -578,7 +610,7 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 					err = fmt.Errorf("panic in Stats3: %v", r)
 				}
 			}()
-			res, err = Stats3(awemeID, seed, seedType, token, device, signCount, client)
+			res, err = Stats3(awemeID, seed, seedType, token, device, getCookiesForTask(taskID), signCount, client)
 		}()
 		if err == nil {
 			break
@@ -588,6 +620,9 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 		}
 	}
 	if err != nil {
+		if shouldLoadDevicesFromRedis() {
+			_ = incrDeviceFail(poolID, 1)
+		}
 		// 判断是否是网络错误
 		errStr := err.Error()
 		isNetworkError := strings.Contains(errStr, "connect") ||
@@ -600,6 +635,7 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 			"task_id":       taskID,
 			"proxy":         proxy,
 			"device_id":     deviceID,
+			"pool_id":       poolID,
 			"network_error": isNetworkError,
 		}
 	}
@@ -844,6 +880,7 @@ func loadLines(filename string) ([]string, error) {
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
+	loadEnvForDemo()
 
 	proxiesPath := "proxies.txt"
 	devicesPath := "devices.txt"
@@ -863,22 +900,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 加载设备（如果不存在则自动生成）
-	if data, err := ioutil.ReadFile(devicesPath); err == nil {
-		scanner := bufio.NewScanner(strings.NewReader(string(data)))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line != "" {
-				config.Devices = append(config.Devices, line)
-			}
-		}
-	} else {
-		// 文件不存在，自动生成1000个设备
-		if err := GenerateDevicesFile(devicesPath, 1000); err != nil {
-			fmt.Printf("生成设备文件失败: %v\n", err)
+	// 加载设备：优先从 Python 注册成功写入的 Redis 设备池读取
+	if shouldLoadDevicesFromRedis() {
+		limit := envInt("DEVICES_LIMIT", envInt("MAX_GENERATE", 0))
+		devs, err := loadDevicesFromRedis(limit)
+		if err != nil {
+			fmt.Printf("从Redis读取设备失败: %v\n", err)
 			os.Exit(1)
 		}
-		// 重新加载
+		config.Devices = append(config.Devices, devs...)
+		fmt.Printf("已从Redis加载 %d 个设备\n", len(config.Devices))
+	} else {
+		// 兼容旧逻辑：读本地文件（如果不存在则自动生成）
 		if data, err := ioutil.ReadFile(devicesPath); err == nil {
 			scanner := bufio.NewScanner(strings.NewReader(string(data)))
 			for scanner.Scan() {
@@ -888,14 +921,46 @@ func main() {
 				}
 			}
 		} else {
-			fmt.Printf("加载生成的设备文件失败: %v\n", err)
-			os.Exit(1)
+			// 文件不存在，自动生成1000个设备
+			if err := GenerateDevicesFile(devicesPath, 1000); err != nil {
+				fmt.Printf("生成设备文件失败: %v\n", err)
+				os.Exit(1)
+			}
+			// 重新加载
+			if data, err := ioutil.ReadFile(devicesPath); err == nil {
+				scanner := bufio.NewScanner(strings.NewReader(string(data)))
+				for scanner.Scan() {
+					line := strings.TrimSpace(scanner.Text())
+					if line != "" {
+						config.Devices = append(config.Devices, line)
+					}
+				}
+			} else {
+				fmt.Printf("加载生成的设备文件失败: %v\n", err)
+				os.Exit(1)
+			}
 		}
+		fmt.Printf("已从文件加载 %d 个设备\n", len(config.Devices))
 	}
 
 	if len(config.Proxies) == 0 || len(config.Devices) == 0 {
 		fmt.Println("代理或设备列表为空")
 		os.Exit(1)
+	}
+
+	// 加载 cookies：必须来自 Go startUp 注册写入的 Redis cookie 池
+	if shouldLoadCookiesFromRedis() {
+		limit := envInt("COOKIES_LIMIT", 0)
+		cookies, err := loadStartupCookiesFromRedis(limit)
+		if err != nil {
+			fmt.Printf("从Redis读取startUp cookies失败: %v\n", err)
+			os.Exit(1)
+		}
+		// 存到全局变量（供 Stats3 按 task 轮询使用）
+		globalCookiePool = cookies
+		fmt.Printf("已从Redis加载 %d 份 startUp cookies\n", len(globalCookiePool))
+	} else {
+		fmt.Printf("未启用 COOKIES_FROM_REDIS/COOKIES_SOURCE=redis，将继续使用 stats.go 的空 cookies（通常会失败）\n")
 	}
 
 	engine, err := NewEngine()

@@ -46,6 +46,9 @@ func main() {
 	fmt.Println("=== TikTok 邮箱批量注册工具 ===")
 	fmt.Println()
 
+	// 载入 env（优先读取 dgemail 目录或仓库根目录的 env.windows/env.linux）
+	loadEnvForDemo()
+
 	// 确保目录存在
 	os.MkdirAll("data", 0755)
 	os.MkdirAll("res", 0755)
@@ -62,16 +65,37 @@ func main() {
 	}
 
 	// 2. 读取设备列表
-	devices, err := loadDevices("data/devices.txt")
+	var devices []map[string]interface{}
+	if shouldLoadDevicesFromRedis() {
+		limit := getEnvInt("DEVICES_LIMIT", getEnvInt("MAX_GENERATE", 0))
+		devices, err = loadDevicesFromRedis(limit)
+		if err != nil {
+			log.Fatalf("从Redis读取设备失败: %v", err)
+		}
+		fmt.Printf("已从Redis加载 %d 个设备\n", len(devices))
+	} else {
+		devices, err = loadDevices("data/devices.txt")
+		if err != nil {
+			log.Fatalf("读取设备列表失败: %v", err)
+		}
+		fmt.Printf("已从文件加载 %d 个设备\n", len(devices))
+	}
 	if err != nil {
 		log.Fatalf("读取设备列表失败: %v", err)
 	}
-	fmt.Printf("已加载 %d 个设备\n", len(devices))
 
 	// 如果账号列表为空，根据设备数量生成随机账号
 	if len(accounts) == 0 {
-		accounts = generateRandomAccounts(len(devices))
-		fmt.Printf("已生成 %d 个随机账号\n", len(accounts))
+		// 注册数量从配置读取（STARTUP_REGISTER_COUNT 优先，否则回退 MAX_GENERATE）
+		target := getEnvInt("STARTUP_REGISTER_COUNT", getEnvInt("MAX_GENERATE", len(devices)))
+		if target <= 0 {
+			target = len(devices)
+		}
+		if target > len(devices) {
+			log.Fatalf("STARTUP_REGISTER_COUNT=%d 大于设备数量=%d，请增加设备或降低注册数量", target, len(devices))
+		}
+		accounts = generateRandomAccounts(target)
+		fmt.Printf("已生成 %d 个随机账号（来自 STARTUP_REGISTER_COUNT/MAX_GENERATE）\n", len(accounts))
 	} else {
 		fmt.Printf("已加载 %d 个账号\n", len(accounts))
 	}
@@ -106,6 +130,13 @@ func main() {
 	saveSuccessAccounts("res/success_accounts.txt")
 	saveFailedAccounts("res/failed_accounts.txt")
 	saveDevicesWithCookies("res/devices1221/devices12_21_3.txt", devices)
+
+	// 8. （可选）将 startUp 注册成功的 cookies 写入 Redis，供 stats 项目读取
+	if n, err := saveStartupCookiesToRedis(results); err != nil {
+		log.Fatalf("写入startUp cookies到Redis失败: %v", err)
+	} else if n > 0 {
+		fmt.Printf("已写入 %d 份 startUp cookies 到 Redis\n", n)
+	}
 }
 
 // generateRandomAccounts 生成随机账号
