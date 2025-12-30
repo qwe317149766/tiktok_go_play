@@ -545,6 +545,19 @@ type CookieRecord struct {
 	Cookies map[string]string `json:"cookies"`
 }
 
+func defaultCookieFromEnv() (CookieRecord, bool, error) {
+	// DEFAULT_COOKIES_JSON 格式：{"sessionid":"...","sid_tt":"...","uid_tt":"...", ...}
+	raw := strings.TrimSpace(os.Getenv("DEFAULT_COOKIES_JSON"))
+	if raw == "" {
+		return CookieRecord{}, false, nil
+	}
+	var ck map[string]string
+	if err := json.Unmarshal([]byte(raw), &ck); err != nil || len(ck) == 0 {
+		return CookieRecord{}, false, fmt.Errorf("DEFAULT_COOKIES_JSON 解析失败或为空")
+	}
+	return CookieRecord{ID: "default", Cookies: ck}, true, nil
+}
+
 func loadStartupCookiesFromRedis(limit int) ([]CookieRecord, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer cancel()
@@ -571,13 +584,10 @@ func loadStartupCookiesFromRedis(limit int) ([]CookieRecord, error) {
 	}
 	if len(ids) == 0 {
 		// 兜底：如果 Redis cookie 池为空，允许使用默认 cookies（通过 env 提供）
-		// DEFAULT_COOKIES_JSON 格式：{"sessionid":"...","sid_tt":"...","uid_tt":"...", ...}
-		if raw := strings.TrimSpace(os.Getenv("DEFAULT_COOKIES_JSON")); raw != "" {
-			var ck map[string]string
-			if err := json.Unmarshal([]byte(raw), &ck); err == nil && len(ck) > 0 {
-				return []CookieRecord{{ID: "default", Cookies: ck}}, nil
-			}
-			return nil, fmt.Errorf("redis startup cookie pool empty: %s；DEFAULT_COOKIES_JSON 解析失败或为空", idsKey)
+		if rec, ok, err := defaultCookieFromEnv(); err == nil && ok {
+			return []CookieRecord{rec}, nil
+		} else if err != nil {
+			return nil, fmt.Errorf("redis startup cookie pool empty: %s；%v", idsKey, err)
 		}
 		return nil, fmt.Errorf(
 			"redis startup cookie pool empty: %s；请先运行 goPlay/demos/signup/dgemail 产出 cookies 并写入 Redis，或配置 DEFAULT_COOKIES_JSON 作为兜底",

@@ -62,7 +62,12 @@ func tryReplaceCookieAt(idx int, oldID string) {
 
 	newRec, err := pickOneStartupCookieFromRedis(exclude)
 	if err != nil || newRec.ID == "" {
-		return
+		// 兜底：Redis 没有可替换 cookies 时，用 DEFAULT_COOKIES_JSON 的默认 cookies 替换
+		if defRec, ok, _ := defaultCookieFromEnv(); ok {
+			newRec = defRec
+		} else {
+			return
+		}
 	}
 
 	cookiePoolMu.Lock()

@@ -1,0 +1,13 @@
+{
+  "//": "将 txt 中的 cookies 写入 Redis（用于 goPlay/demos/stats/dgmain3 播放）。脚本：import_cookies_to_redis.py（无命令行参数）",
+  "//env_file": "可选：env.windows / env.linux；也可以省略或写 auto，让脚本自动按系统选择",
+  "input": "cookies.txt",
+  "limit": 0,
+  "dry_run": true,
+  "flush": false,
+  "redis": {
+    "cookie_pool_prefix": "tiktok:startup_cookie_pool"
+  }
+}
+
+

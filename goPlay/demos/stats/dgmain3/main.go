@@ -254,6 +254,8 @@ type Engine struct {
 	success    int64
 	failed     int64
 	total      int64
+	// inflight：正在执行中的任务数（用于减少达到目标后的“额外一轮并发”）
+	inflight   int64
 	errorStats ErrorStats
 
 	// 动态并发调整
@@ -805,6 +807,8 @@ func (e *Engine) taskWrapper(taskID int) {
 			atomic.AddInt64(&e.total, 1)
 		}
 	}()
+	atomic.AddInt64(&e.inflight, 1)
+	defer atomic.AddInt64(&e.inflight, -1)
 
 	// 获取信号量（阻塞方式，因为worker数量=信号量大小，所以不会死锁）
 	e.sem <- struct{}{}
@@ -991,8 +995,18 @@ func (e *Engine) Run() {
 				}
 
 				success := atomic.LoadInt64(&e.success)
+				inflight := atomic.LoadInt64(&e.inflight)
 				total := atomic.LoadInt64(&e.total)
 
+				// 提前停止：避免达到目标后仍然继续发起一整轮并发请求
+				if config.TargetSuccess > 0 && success+inflight >= config.TargetSuccess {
+					e.stopOnce.Do(func() {
+						if e.stopChan != nil {
+							close(e.stopChan)
+						}
+					})
+					return
+				}
 				if success >= config.TargetSuccess || total >= config.MaxRequests {
 					e.stopOnce.Do(func() {
 						if e.stopChan != nil {

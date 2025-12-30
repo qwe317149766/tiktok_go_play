@@ -85,10 +85,23 @@ func main() {
 		if err != nil {
 			log.Fatalf("读取设备列表失败: %v", err)
 		}
-		fmt.Printf("已从文件加载 %d 个设备\n", len(devices))
+		// 设备最小年龄筛选（create_time 早于 N 小时）
+		if h := getSignupDeviceMinAgeHours(); h > 0 {
+			devices = filterDevicesByMinAge(devices, h)
+			fmt.Printf("已从文件加载 %d 个设备（create_time 早于 %d 小时）\n", len(devices), h)
+		} else {
+			fmt.Printf("已从文件加载 %d 个设备\n", len(devices))
+		}
 	}
 	if err != nil {
 		log.Fatalf("读取设备列表失败: %v", err)
+	}
+
+	// Redis 模式：在 loadDevicesFromRedis 内已做筛选；这里补一句可观测日志
+	if shouldLoadDevicesFromRedis() {
+		if h := getSignupDeviceMinAgeHours(); h > 0 {
+			fmt.Printf("设备已按 create_time 早于 %d 小时筛选（redis 模式）\n", h)
+		}
 	}
 
 	// 如果账号列表为空，根据设备数量生成随机账号
@@ -98,8 +111,10 @@ func main() {
 		if target <= 0 {
 			target = len(devices)
 		}
-		if target > len(devices) {
-			log.Fatalf("STARTUP_REGISTER_COUNT=%d 大于设备数量=%d，请增加设备或降低注册数量", target, len(devices))
+		// 允许设备复用：设备会在并发注册中按索引取模轮询使用
+		// 注意：设备复用可能增加风控/封禁概率，这是预期行为
+		if target > len(devices) && len(devices) > 0 {
+			fmt.Printf("⚠️  STARTUP_REGISTER_COUNT=%d 大于设备数量=%d，将循环复用设备进行注册\n", target, len(devices))
 		}
 		accounts = generateRandomAccounts(target)
 		fmt.Printf("已生成 %d 个随机账号（来自 STARTUP_REGISTER_COUNT/MAX_GENERATE）\n", len(accounts))

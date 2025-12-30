@@ -1,0 +1,7 @@
+﻿{
+  "input": "cookies_sample.txt",
+  "dry_run": true,
+  "limit": 2,
+  "flush": false,
+  "env_file": "auto"
+}

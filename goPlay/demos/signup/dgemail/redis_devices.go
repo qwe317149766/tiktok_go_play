@@ -124,6 +124,7 @@ func loadDevicesFromRedis(limit int) ([]map[string]interface{}, error) {
 		return nil, fmt.Errorf("redis device pool empty: %s", idsKey)
 	}
 
+	minAge := getSignupDeviceMinAgeHours()
 	// 批量 HMGET
 	const chunk = 500
 	devices := make([]map[string]interface{}, 0, len(ids))
@@ -144,6 +145,9 @@ func loadDevicesFromRedis(limit int) ([]map[string]interface{}, error) {
 			}
 			var dev map[string]interface{}
 			if err := json.Unmarshal([]byte(s), &dev); err != nil {
+				continue
+			}
+			if !deviceCreateTimeOK(dev, minAge) {
 				continue
 			}
 			devices = append(devices, dev)

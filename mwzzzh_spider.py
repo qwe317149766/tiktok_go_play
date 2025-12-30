@@ -6,6 +6,7 @@ import random
 import traceback
 import time
 import platform
+import signal
 from itertools import cycle
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any
@@ -291,6 +292,10 @@ class Config:
     # 本地备份分片数：默认等于“线程数”（THREAD_POOL_SIZE）
     # 你的诉求：根据线程数写入，每个线程写自己的 => 用 task_id % FILE_SHARDS 分流到不同文件
     FILE_SHARDS = _get_int_from_env("DEVICE_FILE_SHARDS", default=THREAD_POOL_SIZE)
+    # 文件刷盘策略：
+    # - 默认只 flush（性能更好）
+    # - 打开 MWZZZH_FILE_FSYNC=1 可在每批写入后执行 os.fsync，提升“异常退出时不丢数据”的概率（更慢）
+    FILE_FSYNC = _parse_bool(os.getenv("MWZZZH_FILE_FSYNC"), False)
     # 任务数量：
     # - 优先 MWZZZH_TASKS
     # - 若未配置，则复用 MAX_GENERATE（与你的设备生成配置保持一致）
@@ -306,12 +311,9 @@ class Config:
     )
     # 轮询间隔（秒）
     POLL_INTERVAL_SEC = _get_int_from_env("MWZZZH_POLL_INTERVAL_SEC", default=10)
-    # 设备池目标数量：默认取 REDIS_MAX_DEVICES（若未配置则回退 TASKS）
-    REDIS_TARGET_DEVICES = _get_int_from_env(
-        "REDIS_TARGET_DEVICES",
-        "REDIS_MAX_DEVICES",
-        default=TASKS,
-    )
+    # 设备池最终目标数量：统一使用 REDIS_MAX_DEVICES（作为“池子最终数量/容量”）
+    # - REDIS_TARGET_DEVICES 已废弃（若配置了会被忽略），避免与 REDIS_MAX_DEVICES 冲突
+    REDIS_MAX_DEVICES = _get_int_from_env("REDIS_MAX_DEVICES", default=TASKS)
     # 单轮补齐最大注册数量（避免一次补太多）
     POLL_BATCH_MAX = _get_int_from_env("MWZZZH_POLL_BATCH_MAX", default=TASKS)
 
@@ -409,6 +411,11 @@ class DataPipeline:
         # 尽量及时刷盘（备份用途）
         for fp in self._file_fps:
             fp.flush()
+            if Config.FILE_FSYNC:
+                try:
+                    os.fsync(fp.fileno())
+                except Exception:
+                    pass
 
     async def start(self):
         self._writer_task = asyncio.create_task(self._consumer())
@@ -642,32 +649,55 @@ class SpiderEngine:
 
     async def run(self, tasks_n: int | None = None):
         await self.pipeline.start()
-
-        # 生成任务
-        n = int(tasks_n) if tasks_n is not None else int(Config.TASKS)
-        n = max(0, n)
-        tasks_data = [{"id": i} for i in range(n)]
-        logger.info(f"开始任务，任务数: {n}, 网络并发: {Config.MAX_CONCURRENCY}, 解析线程: {Config.THREAD_POOL_SIZE}")
-
-        coroutines = []
-        for i, params in enumerate(tasks_data):
-            task = asyncio.create_task(self._worker_wrapper(i, params))
-            coroutines.append(task)
-
-        # 等待完成
+        coroutines: list[asyncio.Task] = []
         try:
-            from tqdm.asyncio import tqdm
-            _ = [await f for f in tqdm.as_completed(coroutines)]
-        except ImportError:
-            await asyncio.gather(*coroutines)
+            # 生成任务
+            n = int(tasks_n) if tasks_n is not None else int(Config.TASKS)
+            n = max(0, n)
+            tasks_data = [{"id": i} for i in range(n)]
+            logger.info(
+                f"开始任务，任务数: {n}, 网络并发: {Config.MAX_CONCURRENCY}, 解析线程: {Config.THREAD_POOL_SIZE} "
+                f"(file_backup={Config.SAVE_TO_FILE} dir={Config.FILE_BACKUP_DIR} shards={Config.FILE_SHARDS} fsync={Config.FILE_FSYNC})"
+            )
 
-        logger.info("任务完成，清理中...")
+            for i, params in enumerate(tasks_data):
+                coroutines.append(asyncio.create_task(self._worker_wrapper(i, params)))
 
-        # 关闭线程池
-        self.cpu_pool.shutdown()
-        await self.pipeline.stop()
-        if self.session_pool is not None:
-            await self.session_pool.close()
+            # 等待完成（可被取消）
+            try:
+                from tqdm.asyncio import tqdm
+                _ = [await f for f in tqdm.as_completed(coroutines)]
+            except ImportError:
+                await asyncio.gather(*coroutines)
+
+        except asyncio.CancelledError:
+            logger.warning("收到取消信号，准备优雅退出（先落盘队列）...")
+            raise
+        finally:
+            # 先取消 worker，避免继续往 pipeline 塞数据
+            for t in coroutines:
+                if not t.done():
+                    t.cancel()
+            if coroutines:
+                _ = await asyncio.gather(*coroutines, return_exceptions=True)
+
+            logger.info("任务结束，清理中（将等待写入队列落盘）...")
+            try:
+                await self.pipeline.stop()
+            except Exception as e:
+                logger.critical(f"[pipeline] stop 失败: {e}")
+                # stop 失败时不硬退出，让上层看日志
+
+            # 关闭线程池 / session
+            try:
+                self.cpu_pool.shutdown()
+            except Exception:
+                pass
+            if self.session_pool is not None:
+                try:
+                    await self.session_pool.close()
+                except Exception:
+                    pass
 
 
 async def _poll_fill_loop() -> None:
@@ -681,12 +711,18 @@ async def _poll_fill_loop() -> None:
         raise SystemExit(1)
 
     interval = max(1, int(Config.POLL_INTERVAL_SEC))
-    target = max(0, int(Config.REDIS_TARGET_DEVICES))
+    # 目标数量：统一使用 REDIS_MAX_DEVICES
+    target = max(0, int(Config.REDIS_MAX_DEVICES))
     batch_max = max(1, int(Config.POLL_BATCH_MAX))
 
     if target <= 0:
-        logger.critical("[poll] REDIS_TARGET_DEVICES/REDIS_MAX_DEVICES 需要 > 0")
+        logger.critical("[poll] REDIS_MAX_DEVICES 需要 > 0")
         raise SystemExit(1)
+
+    # REDIS_TARGET_DEVICES 已废弃：若用户仍配置，提示但忽略
+    legacy_target = os.getenv("REDIS_TARGET_DEVICES")
+    if legacy_target is not None and legacy_target.strip():
+        logger.warning("[poll] 检测到已废弃配置 REDIS_TARGET_DEVICES，将忽略并以 REDIS_MAX_DEVICES 为准")
 
     logger.info(f"[poll] 启动：interval={interval}s target={target} batch_max={batch_max}")
 
@@ -739,10 +775,13 @@ if __name__ == "__main__":
     if sys.platform.startswith('win'):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    if Config.POLL_MODE:
-        asyncio.run(_poll_fill_loop())
-    else:
-        engine = SpiderEngine()
-        asyncio.run(engine.run())
+    try:
+        if Config.POLL_MODE:
+            asyncio.run(_poll_fill_loop())
+        else:
+            engine = SpiderEngine()
+            asyncio.run(engine.run())
+    except KeyboardInterrupt:
+        print("收到 Ctrl+C，已退出（建议开启 MWZZZH_FILE_FSYNC=1 提升异常退出不丢数据概率）")
     t1 = time.time()
     print("总耗时===>",t1-t)
