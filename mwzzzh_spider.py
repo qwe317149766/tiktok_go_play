@@ -104,6 +104,7 @@ class RedisConfig:
     key_prefix: str
     id_field: str
     max_size: int
+    evict_policy: str  # play/use/attempt
 
 
 def _get_redis_config(max_devices_default: int) -> RedisConfig:
@@ -117,6 +118,7 @@ def _get_redis_config(max_devices_default: int) -> RedisConfig:
     key_prefix = os.getenv("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool")
     id_field = os.getenv("REDIS_DEVICE_ID_FIELD", "cdid")
     max_size = int(os.getenv("REDIS_MAX_DEVICES", str(max_devices_default)))
+    evict_policy = (os.getenv("REDIS_EVICT_POLICY", "play") or "play").strip().lower()
     return RedisConfig(
         url=url,
         host=host,
@@ -128,6 +130,7 @@ def _get_redis_config(max_devices_default: int) -> RedisConfig:
         key_prefix=key_prefix,
         id_field=id_field,
         max_size=max_size,
+        evict_policy=evict_policy,
     )
 
 
@@ -150,6 +153,9 @@ class RedisDevicePool:
         self.data_key = f"{cfg.key_prefix}:data"
         self.use_key = f"{cfg.key_prefix}:use"
         self.fail_key = f"{cfg.key_prefix}:fail"
+        # 计数：Go stats 会写 play/attempt；Python 写入时也初始化为 0，方便后续淘汰
+        self.play_key = f"{cfg.key_prefix}:play"
+        self.attempt_key = f"{cfg.key_prefix}:attempt"
 
         try:
             import redis  # type: ignore
@@ -204,6 +210,8 @@ class RedisDevicePool:
             if not existed:
                 pipe.zadd(self.use_key, {dev_id: 0})
                 pipe.zadd(self.fail_key, {dev_id: 0})
+                pipe.zadd(self.play_key, {dev_id: 0})
+                pipe.zadd(self.attempt_key, {dev_id: 0})
             pipe.execute()
             write_n += 1
 
@@ -218,7 +226,19 @@ class RedisDevicePool:
         if cur <= max_size:
             return 0
         excess = cur - max_size
-        ids = self.r.zrevrange(self.use_key, 0, excess - 1)
+        # 淘汰策略：优先按播放次数(play)最大淘汰；如果 play 为空则回退 use（历史兼容）。
+        policy = (self.cfg.evict_policy or "play").lower()
+        if policy not in {"play", "use", "attempt"}:
+            policy = "play"
+        zkey = self.play_key if policy == "play" else (self.attempt_key if policy == "attempt" else self.use_key)
+        # 若选择 play/attempt 但没有任何成员，则回退到 use
+        try:
+            if zkey != self.use_key and int(self.r.zcard(zkey)) == 0:
+                zkey = self.use_key
+        except Exception:
+            zkey = self.use_key
+
+        ids = self.r.zrevrange(zkey, 0, excess - 1)
         if not ids:
             return 0
         pipe = self.r.pipeline(transaction=True)
@@ -227,6 +247,8 @@ class RedisDevicePool:
             pipe.hdel(self.data_key, dev_id)
             pipe.zrem(self.use_key, dev_id)
             pipe.zrem(self.fail_key, dev_id)
+            pipe.zrem(self.play_key, dev_id)
+            pipe.zrem(self.attempt_key, dev_id)
         pipe.execute()
         return len(ids)
 
