@@ -599,9 +599,9 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 	var err error
 	// 执行stats请求 - 添加快速重试（最多2次）
 	for retry := 0; retry < 2; retry++ {
-		// 播放次数（use_count）与设备使用次数统一：每次发起 stats 请求即 +1
+		// 尝试次数：每次发起 stats 请求即 +1
 		if shouldLoadDevicesFromRedis() {
-			_ = incrDeviceUse(poolID, 1)
+			_ = incrDeviceAttempt(poolID, 1)
 		}
 		// 使用defer recover来捕获panic
 		func() {
@@ -641,6 +641,10 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 	}
 
 	success := res != ""
+	// 播放次数：只在成功时 +1
+	if success && shouldLoadDevicesFromRedis() {
+		_ = incrDevicePlay(poolID, 1)
+	}
 	result := map[string]interface{}{
 		"stage": "stats",
 		"raw":   "",
