@@ -9,6 +9,7 @@ import platform
 from itertools import cycle
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any
+from dataclasses import dataclass
 
 # 你的核心请求库
 from curl_cffi.requests import AsyncSession
@@ -49,6 +50,16 @@ def _load_env_for_runtime() -> str | None:
 
 _MWZZZH_ENV_FILE = _load_env_for_runtime()
 
+def _parse_bool(v: str | None, default: bool) -> bool:
+    if v is None:
+        return default
+    v = v.strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
 def _get_int_from_env(*names: str, default: int) -> int:
     """
     按优先级读取多个环境变量中的第一个“可解析为 int”的值。
@@ -81,6 +92,145 @@ def _auto_thread_pool_size() -> int:
     return _clamp(int(cores) * 2, 4, 64)
 
 
+@dataclass(frozen=True)
+class RedisConfig:
+    url: str | None
+    host: str
+    port: int
+    db: int
+    username: str | None
+    password: str | None
+    ssl: bool
+    key_prefix: str
+    id_field: str
+    max_size: int
+
+
+def _get_redis_config(max_devices_default: int) -> RedisConfig:
+    url = os.getenv("REDIS_URL") or None
+    host = os.getenv("REDIS_HOST", "127.0.0.1")
+    port = int(os.getenv("REDIS_PORT", "6379"))
+    db = int(os.getenv("REDIS_DB", "0"))
+    username = os.getenv("REDIS_USERNAME") or None
+    password = os.getenv("REDIS_PASSWORD") or None
+    ssl = _parse_bool(os.getenv("REDIS_SSL"), False)
+    key_prefix = os.getenv("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool")
+    id_field = os.getenv("REDIS_DEVICE_ID_FIELD", "cdid")
+    max_size = int(os.getenv("REDIS_MAX_DEVICES", str(max_devices_default)))
+    return RedisConfig(
+        url=url,
+        host=host,
+        port=port,
+        db=db,
+        username=username,
+        password=password,
+        ssl=ssl,
+        key_prefix=key_prefix,
+        id_field=id_field,
+        max_size=max_size,
+    )
+
+
+class RedisDevicePool:
+    """
+    Redis 设备池：注册成功设备写入这里，供后续 Go/其它模块消费
+
+    Key 结构（全部基于 key_prefix）：
+    - {prefix}:ids   (SET)  所有设备 id
+    - {prefix}:data  (HASH) id -> device_json
+    - {prefix}:use   (ZSET) id -> use_count
+    - {prefix}:fail  (ZSET) id -> fail_count
+
+    超限淘汰：use_count 最大的先淘汰（最常用的淘汰）
+    """
+
+    def __init__(self, cfg: RedisConfig):
+        self.cfg = cfg
+        self.ids_key = f"{cfg.key_prefix}:ids"
+        self.data_key = f"{cfg.key_prefix}:data"
+        self.use_key = f"{cfg.key_prefix}:use"
+        self.fail_key = f"{cfg.key_prefix}:fail"
+
+        try:
+            import redis  # type: ignore
+        except Exception as e:
+            raise RuntimeError("缺少依赖：redis，请先 pip install -r requirements.txt") from e
+
+        if cfg.url:
+            self.r = redis.Redis.from_url(cfg.url, decode_responses=True)
+        else:
+            self.r = redis.Redis(
+                host=cfg.host,
+                port=cfg.port,
+                db=cfg.db,
+                username=cfg.username,
+                password=cfg.password,
+                ssl=cfg.ssl,
+                decode_responses=True,
+            )
+
+    def ping(self) -> None:
+        self.r.ping()
+
+    def _extract_id(self, device: Dict[str, Any]) -> str:
+        raw = device.get(self.cfg.id_field)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        # fallback：尽量找稳定字段
+        for k in ("cdid", "clientudid", "openudid", "device_id", "install_id"):
+            v = device.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # 最后兜底
+        return f"anon:{time.time_ns()}"
+
+    def add_devices(self, devices: list[Dict[str, Any]]) -> tuple[int, int]:
+        """
+        批量写入：
+        - 新设备：初始化 use=0, fail=0
+        - 旧设备：更新 data，不重置计数
+        返回：(写入数量, 淘汰数量)
+        """
+        write_n = 0
+        for dev in devices:
+            dev_id = self._extract_id(dev)
+            dev_json = json.dumps(dev, ensure_ascii=False, separators=(",", ":"))
+
+            # existed?
+            existed = bool(self.r.sismember(self.ids_key, dev_id))
+            pipe = self.r.pipeline(transaction=True)
+            pipe.sadd(self.ids_key, dev_id)
+            pipe.hset(self.data_key, dev_id, dev_json)
+            if not existed:
+                pipe.zadd(self.use_key, {dev_id: 0})
+                pipe.zadd(self.fail_key, {dev_id: 0})
+            pipe.execute()
+            write_n += 1
+
+        evicted = self.evict_if_needed()
+        return write_n, evicted
+
+    def evict_if_needed(self) -> int:
+        max_size = max(0, int(self.cfg.max_size))
+        if max_size <= 0:
+            return 0
+        cur = int(self.r.scard(self.ids_key))
+        if cur <= max_size:
+            return 0
+        excess = cur - max_size
+        ids = self.r.zrevrange(self.use_key, 0, excess - 1)
+        if not ids:
+            return 0
+        pipe = self.r.pipeline(transaction=True)
+        for dev_id in ids:
+            pipe.srem(self.ids_key, dev_id)
+            pipe.hdel(self.data_key, dev_id)
+            pipe.zrem(self.use_key, dev_id)
+            pipe.zrem(self.fail_key, dev_id)
+        pipe.execute()
+        return len(ids)
+
+
 # ================= 1. 配置区域 =================
 class Config:
     # 网络并发数 (Async Semaphores)
@@ -101,6 +251,9 @@ class Config:
 
     RESULT_FILE = "results12_21_5.jsonl"
     ERROR_FILE = "error.log"
+
+    # 是否保存“注册成功设备”到 Redis
+    SAVE_TO_REDIS = _parse_bool(os.getenv("SAVE_TO_REDIS"), False)
     # 任务数量：
     # - 优先 MWZZZH_TASKS
     # - 若未配置，则复用 MAX_GENERATE（与你的设备生成配置保持一致）
@@ -125,12 +278,13 @@ logger.addHandler(fh)
 
 # ================= 3. 数据管道 (保持不变) =================
 class DataPipeline:
-    def __init__(self, filename):
+    def __init__(self, filename, redis_pool: RedisDevicePool | None = None):
         self.filename = filename
         self.queue = asyncio.Queue()
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.running = True
         self._writer_task = None
+        self.redis_pool = redis_pool
 
     async def start(self):
         self._writer_task = asyncio.create_task(self._consumer())
@@ -147,6 +301,14 @@ class DataPipeline:
         except Exception as e:
             logger.error(f"写入失败: {e}")
 
+        # 同步写入 Redis（在 executor 线程中执行，不阻塞 event loop）
+        if self.redis_pool is not None:
+            # Redis 打开时：任何写入失败都应该终止程序（避免“跑了但没入库”）
+            _, evicted = self.redis_pool.add_devices(batch)
+            if evicted:
+                # 不刷屏，只在发生淘汰时提示一次
+                logger.info(f"[redis] 设备池已满，已淘汰 {evicted} 条（按 use_count 最大）")
+
     async def _consumer(self):
         batch = []
         while self.running or not self.queue.empty():
@@ -159,9 +321,17 @@ class DataPipeline:
             if len(batch) >= 20 or (not self.running and batch):
                 to_write = batch[:]
                 batch.clear()
-                await asyncio.get_event_loop().run_in_executor(
-                    self.executor, self._write_impl, to_write
-                )
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        self.executor, self._write_impl, to_write
+                    )
+                except Exception as e:
+                    # 如果开启了 Redis，这里视为致命错误：立即退出
+                    if self.redis_pool is not None:
+                        logger.critical(f"[redis] 致命：写入失败，程序终止: {e}")
+                        os._exit(1)
+                    # 未开启 Redis：保留原行为，只记录错误继续
+                    logger.error(f"写入线程异常: {e}")
 
     async def stop(self):
         self.running = False
@@ -222,7 +392,20 @@ async def user_custom_logic(task_id, task_params, proxy, pipeline, thread_pool):
 class SpiderEngine:
     def __init__(self):
         self.proxy_cycle = cycle(Config.PROXIES)
-        self.pipeline = DataPipeline(Config.RESULT_FILE)
+
+        redis_pool = None
+        if Config.SAVE_TO_REDIS:
+            try:
+                rcfg = _get_redis_config(max_devices_default=Config.TASKS)
+                redis_pool = RedisDevicePool(rcfg)
+                redis_pool.ping()
+                logger.info(f"[redis] 启用成功 key_prefix={rcfg.key_prefix} id_field={rcfg.id_field} max={rcfg.max_size}")
+            except Exception as e:
+                # Redis 打开时：连接失败直接终止程序
+                logger.critical(f"[redis] 启用失败，程序终止: {e}")
+                raise SystemExit(1)
+
+        self.pipeline = DataPipeline(Config.RESULT_FILE, redis_pool=redis_pool)
         self.sem = asyncio.Semaphore(Config.MAX_CONCURRENCY)
 
         # 【新增】计算型线程池
