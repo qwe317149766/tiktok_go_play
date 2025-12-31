@@ -798,12 +798,11 @@ func pickOneDeviceFromRedis(exclude map[string]bool) (string, string, error) {
 // -------- startup cookie pool (来自 Go startUp 注册写入) --------
 
 func shouldLoadCookiesFromRedis() bool {
-	if envBool("COOKIES_FROM_REDIS", false) {
-		return true
-	}
-	if strings.EqualFold(envStr("COOKIES_SOURCE", ""), "redis") {
-		return true
-	}
+	// ✅ 按你的要求：stats 项目的 cookies 只能从 signup 产出的账号 JSON/设备文件中解析，
+	// 不再支持 COOKIES_SOURCE=redis（避免设备与 cookies 来源混淆、不同源）。
+	//
+	// 注意：stats 仍然可以从 Redis 读取“账号池(DEVICES_SOURCE=startup_cookie_redis)”，
+	// 但 cookies 必须来自该账号 JSON 的 cookies 字段，而不是另一套 cookie 池读取逻辑。
 	return false
 }
 
@@ -1242,7 +1241,24 @@ func cookiesFromStartupDeviceJSONLine(line string) (CookieRecord, bool) {
 	if len(ck) == 0 {
 		return CookieRecord{}, false
 	}
-	id := cookieIDFromMap(ck)
+	// 关键：stats 在 startup_cookie_redis 模式下，cookie pool 的“主键”必须与账号池一致。
+	// signup 写入 startup_cookie_pool 时：ids/data/use 的 member/key 使用的是 device_id。
+	// 如果这里用 sessionid/sid_tt，会导致 :use 计数、cookie 替换、exclude 都对不上。
+	id := ""
+	if did, ok := m["device_id"]; ok {
+		switch t := did.(type) {
+		case string:
+			id = strings.TrimSpace(t)
+		case float64:
+			id = fmt.Sprintf("%.0f", t)
+		default:
+			id = strings.TrimSpace(fmt.Sprintf("%v", t))
+		}
+	}
+	if id == "" {
+		// 兜底：没有 device_id 时才回退 cookieID（兼容旧文件/异常数据）
+		id = cookieIDFromMap(ck)
+	}
 	return CookieRecord{ID: id, Cookies: ck}, true
 }
 

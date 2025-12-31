@@ -181,7 +181,7 @@ func main() {
 	saveResults("res/register_results.json")
 	saveSuccessAccounts("res/success_accounts.txt")
 	saveFailedAccounts("res/failed_accounts.txt")
-	saveDevicesWithCookies("res/devices1221/devices12_21_3.txt", devices)
+	saveDevicesWithCookies(startupDevicesWithCookiesOutPath(), devices)
 	// 7.1 固定目录 JSONL 日志（例如 results_w01_part0002.jsonl）
 	saveResultsJSONLFixed()
 
@@ -202,6 +202,17 @@ func main() {
 	} else if n > 0 {
 		fmt.Printf("已写入 %d 个 startUp devices 到 Redis 设备池(%s)\n", n, getEnvStr("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool"))
 	}
+}
+
+// startupDevicesWithCookiesOutPath 生成“类似 devices12_20.txt 的文件名”，用于保存 signup 成功账号 JSON（每行一个）
+// - 可通过 env 覆盖：DGEMAIL_STARTUP_DEVICES_FILE
+// - 默认：goPlay/demos/signup/dgemail/res/devicesMM_DD.txt（与你现有命名一致）
+func startupDevicesWithCookiesOutPath() string {
+	if p := strings.TrimSpace(getEnvStr("DGEMAIL_STARTUP_DEVICES_FILE", "")); p != "" {
+		return p
+	}
+	name := time.Now().Format("devices01_02.txt") // 例如 devices12_20.txt
+	return filepath.Join("res", name)
 }
 
 // generateRandomAccounts 生成随机账号
@@ -410,21 +421,23 @@ func registerAccounts(accounts []AccountInfo, devices []map[string]interface{}, 
 			atomic.AddInt64(&totalCount, 1)
 			if result.Success {
 				atomic.AddInt64(&successCount, 1)
-				// ✅ 注册成功立刻把“完整账号 JSON（设备字段+cookies字段）”写入账号池，避免 stats 等到整批结束
-				if startupAccountStreamEnabled() && len(result.Cookies) > 0 {
-					// 复制 deviceRaw，避免并发读写
-					accJSON := make(map[string]interface{}, len(deviceRaw)+2)
-					for k, v := range deviceRaw {
-						accJSON[k] = v
+				// ✅ 注册成功立刻构造“账号 JSON（完整设备字段+cookies+create_time）”
+				// 要求：写入 Redis 的 JSON 必须与写入文件的 JSON 一致
+				if len(result.Cookies) > 0 {
+					accJSON := buildStartupAccountJSON(deviceRaw, result.Cookies)
+					// 1) 实时写入 Redis 账号池（避免 stats 等到整批结束）
+					if startupAccountStreamEnabled() {
+						enqueueStartupAccountForRedis(accJSON)
 					}
-					if _, ok := accJSON["create_time"]; !ok {
-						accJSON["create_time"] = time.Now().Format("2006-01-02 15:04:05")
-					}
-					accJSON["cookies"] = convertCookiesToPythonDict(result.Cookies)
-					enqueueStartupAccountForRedis(accJSON)
+					// 2) 实时写入 Log/ startup_accounts_*.jsonl（与 Redis 完全一致）
+					appendStartupAccountJSONLFixed(accJSON)
 				}
+				// ✅ signup 设备淘汰策略：成功次数 >3 删设备；连续失败 >10 也删设备（仅 Redis 设备池模式生效）
+				signupDeviceUsageUpdate(result.DeviceID, true)
 			} else {
 				atomic.AddInt64(&failedCount, 1)
+				// ✅ 连续失败计数（仅 Redis 设备池模式生效）
+				signupDeviceUsageUpdate(result.DeviceID, false)
 			}
 
 			// 保存结果（同时保存原始设备数据用于后续保存）
@@ -710,27 +723,33 @@ func buildStartupDevicesWithCookies(devices []map[string]interface{}, regs []Reg
 		if deviceRaw == nil {
 			continue
 		}
-
-		// 复制原始设备字段（避免直接修改 deviceRaw）
-		newDevice := make(map[string]interface{}, len(deviceRaw)+2)
-		for k, v := range deviceRaw {
-			newDevice[k] = v
-		}
-		// 确保 create_time 存在
-		if _, ok := newDevice["create_time"]; !ok {
-			newDevice["create_time"] = time.Now().Format("2006-01-02 15:04:05")
-		}
-
-		// 填充 cookies（注册成功的结果）
-		if result.Cookies != nil {
-			newDevice["cookies"] = convertCookiesToPythonDict(result.Cookies)
-		} else {
-			newDevice["cookies"] = ""
-		}
-
-		out = append(out, newDevice)
+		out = append(out, buildStartupAccountJSON(deviceRaw, result.Cookies))
 	}
 	return out
+}
+
+// buildStartupAccountJSON 统一构造“账号池 account JSON”，确保：
+// - Redis 写入与文件写入完全一致
+// - 字段：保留原始 device JSON 全部字段 + cookies + create_time
+func buildStartupAccountJSON(deviceRaw map[string]interface{}, cookies map[string]string) map[string]interface{} {
+	if deviceRaw == nil {
+		return nil
+	}
+	acc := make(map[string]interface{}, len(deviceRaw)+2)
+	for k, v := range deviceRaw {
+		acc[k] = v
+	}
+	// 确保 create_time 存在
+	if _, ok := acc["create_time"]; !ok {
+		acc["create_time"] = time.Now().Format("2006-01-02 15:04:05")
+	}
+	// cookies 统一为 python dict string（与原有 Redis/文件兼容）
+	if cookies != nil {
+		acc["cookies"] = convertCookiesToPythonDict(cookies)
+	} else {
+		acc["cookies"] = "{}"
+	}
+	return acc
 }
 
 // convertCookiesToPythonDict 将 cookies map 转换为 Python 字典格式的字符串
