@@ -1836,36 +1836,9 @@ func main() {
 		}
 		globalCookiePool = cookies
 		fmt.Printf("已从设备列表抽取 %d 份 cookies（来自每行 cookies 字段）\n", len(globalCookiePool))
-	} else if shouldLoadCookiesFromRedis() {
-		// 强提示：如果你想“设备也来自 signup 注册成功账号池”，请打开 DEVICES_SOURCE=startup_redis，
-		// 并让 COOKIES_SOURCE=devices_file 从设备 JSON 的 cookies 字段抽取（做到设备+cookies 同源）。
-		if !shouldLoadDevicesFromStartupRedis() && !shouldLoadDevicesFromStartupCookieRedis() {
-			fmt.Printf("⚠️  当前 COOKIES_SOURCE=redis 但 DEVICES_SOURCE 不是 startup_redis/startup_cookie_redis：设备可能不来自 signup 注册成功账号池。建议：DEVICES_SOURCE=startup_cookie_redis + COOKIES_SOURCE=devices_file\n")
-		}
-		limit := envInt("COOKIES_LIMIT", 0)
-		// 你要求：当 cookies 池为空时不要直接开跑，而是轮询等待（由 signup/dgemail cookie poll 补齐）
-		pollSec := envInt("STATS_COOKIE_POLL_INTERVAL_SEC", envInt("COOKIES_POLL_INTERVAL_SEC", 10))
-		if pollSec <= 0 {
-			pollSec = 10
-		}
-		for {
-			cookies, err := loadStartupCookiesFromRedis(limit)
-			if err != nil {
-				fmt.Printf("从Redis读取startUp cookies失败: %v\n", err)
-				os.Exit(1)
-			}
-			if len(cookies) > 0 {
-				// 存到全局变量（供 Stats3 按 task 轮询使用）
-				globalCookiePool = cookies
-				fmt.Printf("已从Redis加载 %d 份 startUp cookies\n", len(globalCookiePool))
-				break
-			}
-			fmt.Printf("startUp cookies 池为空（REDIS_STARTUP_COOKIE_POOL_KEY=%s），将每 %d 秒轮询等待补齐...\n",
-				strings.TrimSpace(envStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")), pollSec)
-			time.Sleep(time.Duration(pollSec) * time.Second)
-		}
 	} else {
-		fmt.Printf("未启用 COOKIES_SOURCE=redis（COOKIES_FROM_REDIS 为旧兼容写法），将继续使用 stats.go 的空 cookies（通常会失败）\n")
+		fmt.Printf("cookies 未配置：请使用 DEVICES_SOURCE=startup_cookie_redis（推荐）或 COOKIES_SOURCE=devices_file，从 signup 产出的账号 JSON 里解析 cookies\n")
+		os.Exit(1)
 	}
 
 	// Linux 抢单模式：从数据库抢未完成订单，按订单 aweme_id 执行播放，并实时写 Redis/回写数据库

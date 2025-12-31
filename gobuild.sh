@@ -8,6 +8,7 @@ set -e
 GO_VERSION="1.22.1"
 INSTALL_DIR="/usr/local"
 PROFILE_FILE="/etc/profile.d/go.sh"
+GOPATH_DIR="/opt/go"
 
 ############################
 # 必须使用 root
@@ -24,7 +25,7 @@ fi
 
 echo "==> 安装基础工具"
 apt update -y
-apt install -y curl wget git tar
+apt install -y curl wget git tar ca-certificates
 
 ############################
 # 检测架构
@@ -41,6 +42,19 @@ case $ARCH in
 esac
 
 ############################
+# 检测是否已安装同版本
+############################
+
+if [ -x "${INSTALL_DIR}/go/bin/go" ]; then
+    INSTALLED_VERSION=$(${INSTALL_DIR}/go/bin/go version | awk '{print $3}' | sed 's/go//')
+    if [ "$INSTALLED_VERSION" = "$GO_VERSION" ]; then
+        echo "✅ Go ${GO_VERSION} 已安装，跳过安装步骤"
+    else
+        echo "⚠️ 检测到已安装 Go ${INSTALLED_VERSION}，将升级到 ${GO_VERSION}"
+    fi
+fi
+
+############################
 # 下载 Go
 ############################
 
@@ -50,7 +64,12 @@ GO_URL="https://go.dev/dl/${GO_TAR}"
 echo "==> 下载 Go ${GO_VERSION} (${GO_ARCH})"
 cd /tmp
 rm -f ${GO_TAR}
-wget -q ${GO_URL}
+
+wget -q --show-progress ${GO_URL}
+if [ ! -f "${GO_TAR}" ]; then
+    echo "❌ Go 下载失败"
+    exit 1
+fi
 
 ############################
 # 安装 Go
@@ -59,9 +78,10 @@ wget -q ${GO_URL}
 echo "==> 安装 Go 到 ${INSTALL_DIR}/go"
 rm -rf ${INSTALL_DIR}/go
 tar -C ${INSTALL_DIR} -xzf ${GO_TAR}
+rm -f ${GO_TAR}
 
 ############################
-# 配置环境变量
+# 配置环境变量（全局）
 ############################
 
 echo "==> 配置环境变量"
@@ -69,27 +89,36 @@ echo "==> 配置环境变量"
 cat > ${PROFILE_FILE} <<EOF
 # Go environment
 export GOROOT=${INSTALL_DIR}/go
-export GOPATH=/opt/go
-export PATH=\$PATH:\$GOROOT/bin:\$GOPATH/bin
+export GOPATH=${GOPATH_DIR}
+export PATH=\$GOROOT/bin:\$GOPATH/bin:\$PATH
 
 # Go Modules
 export GO111MODULE=on
 export GOPROXY=https://goproxy.cn,direct
 EOF
 
-chmod +x ${PROFILE_FILE}
+chmod 644 ${PROFILE_FILE}
+
+############################
+# 兼容 root 非登录 shell
+############################
+
+if ! grep -q "/etc/profile.d/go.sh" /root/.bashrc 2>/dev/null; then
+    echo "source /etc/profile.d/go.sh" >> /root/.bashrc
+fi
 
 ############################
 # 创建 GOPATH
 ############################
 
-mkdir -p /opt/go/{bin,pkg,src}
-chmod -R 755 /opt/go
+mkdir -p ${GOPATH_DIR}/{bin,pkg,src}
+chmod -R 755 ${GOPATH_DIR}
 
 ############################
-# 立即生效
+# 立即生效（当前 shell）
 ############################
 
+source /etc/profile
 source ${PROFILE_FILE}
 
 ############################
@@ -97,7 +126,10 @@ source ${PROFILE_FILE}
 ############################
 
 echo "==> 验证 Go 安装"
+echo "GOROOT=$(go env GOROOT)"
+echo "GOPATH=$(go env GOPATH)"
+echo "PATH=$PATH"
 go version
 go env GOPROXY
 
-echo "✅ Go ${GO_VERSION} 安装完成"
+echo "🎉 Go ${GO_VERSION} 安装完成（环境变量已全局生效）"

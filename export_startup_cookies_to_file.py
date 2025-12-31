@@ -106,7 +106,7 @@ def _hmget_chunks(r, data_key: str, ids: List[str], chunk: int) -> Iterable[Tupl
             yield sub[idx], s
 
 
-def export_one_prefix(r, prefix: str, out_fp, limit: int, hmget_chunk: int) -> int:
+def export_one_prefix(r, prefix: str, out_fp, limit: int, hmget_chunk: int, mode: str) -> int:
     ids_key = f"{prefix}:ids"
     data_key = f"{prefix}:data"
 
@@ -124,7 +124,13 @@ def export_one_prefix(r, prefix: str, out_fp, limit: int, hmget_chunk: int) -> i
             continue
         if not isinstance(ck, dict) or not ck:
             continue
-        out_fp.write(json.dumps({"id": cid, "cookies": ck}, ensure_ascii=False) + "\n")
+        # 默认导出“账号原始 JSON”（与 signup 落盘 devices12_20.txt 一致：完整 device 字段 + create_time + cookies 字段）
+        # 旧格式兼容：cookie_record -> {"id": "...", "cookies": {...}}
+        if mode == "cookie_record":
+            out_fp.write(json.dumps({"id": cid, "cookies": ck}, ensure_ascii=False) + "\n")
+        else:
+            # account：直接输出 Redis 中的 value（ck 本身就是完整账号 JSON）
+            out_fp.write(json.dumps(ck, ensure_ascii=False) + "\n")
         wrote += 1
         if limit > 0 and wrote >= limit:
             break
@@ -134,13 +140,15 @@ def export_one_prefix(r, prefix: str, out_fp, limit: int, hmget_chunk: int) -> i
 def main():
     _load_env()
 
-    ap = argparse.ArgumentParser(description="导出 Redis 的 startUp cookies 池到文件（JSONL，一行一个）")
-    ap.add_argument("--out", default="startup_cookies.jsonl", help="输出文件路径（默认 startup_cookies.jsonl）")
+    ap = argparse.ArgumentParser(description="导出 Redis 的 startup_cookie_pool 到文件（JSONL，一行一个）")
+    ap.add_argument("--out", default="startup_accounts.jsonl", help="输出文件路径（默认 startup_accounts.jsonl）")
     ap.add_argument("--limit", type=int, default=0, help="最多导出多少条（0=不限制）")
     ap.add_argument("--hmget-chunk", type=int, default=_get_int("REDIS_HMGET_CHUNK", 500), help="HMGET 分批大小")
     ap.add_argument("--shards", type=int, default=_get_int("REDIS_COOKIE_POOL_SHARDS", 1), help="cookies 分库数（默认取 env）")
     ap.add_argument("--prefix", default=os.getenv("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool"),
                     help="cookies 池前缀（默认取 env: REDIS_STARTUP_COOKIE_POOL_KEY）")
+    ap.add_argument("--mode", default="account", choices=["account", "cookie_record"],
+                    help="导出格式：account=直接导出账号原始JSON（默认，推荐）；cookie_record=导出 {id,cookies} 包装格式（兼容旧用法）")
     args = ap.parse_args()
 
     prefix_base = _normalize_pool_base(args.prefix or "tiktok:startup_cookie_pool")
@@ -159,12 +167,12 @@ def main():
     with out_path.open("w", encoding="utf-8") as f:
         for i in range(shards):
             p = prefix_base if i == 0 else f"{prefix_base}:{i}"
-            n = export_one_prefix(r, p, f, limit=0, hmget_chunk=hmget_chunk)
+            n = export_one_prefix(r, p, f, limit=0, hmget_chunk=hmget_chunk, mode=str(args.mode))
             total += n
             if limit > 0 and total >= limit:
                 break
 
-    print(f"已导出 cookies={total} 到文件: {out_path}")
+    print(f"已导出 records={total} 到文件: {out_path} (mode={args.mode})")
 
 
 if __name__ == "__main__":
