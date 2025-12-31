@@ -135,8 +135,11 @@ func main() {
 	fmt.Printf("已加载 %d 个代理\n", len(proxies))
 
 	// 4. 设置并发数（降低并发以提高成功率）
-	maxConcurrency := 50
-	fmt.Printf("并发数: %d (已优化以提高成功率)\n", maxConcurrency)
+	maxConcurrency := getEnvInt("SIGNUP_CONCURRENCY", 50)
+	if maxConcurrency <= 0 {
+		maxConcurrency = 50
+	}
+	fmt.Printf("并发数: %d (来自 SIGNUP_CONCURRENCY)\n", maxConcurrency)
 	fmt.Println()
 
 	// 5. 开始并发注册

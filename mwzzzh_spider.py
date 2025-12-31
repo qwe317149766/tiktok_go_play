@@ -316,6 +316,8 @@ class Config:
     REDIS_MAX_DEVICES = _get_int_from_env("REDIS_MAX_DEVICES", default=TASKS)
     # 单轮补齐最大注册数量（避免一次补太多）
     POLL_BATCH_MAX = _get_int_from_env("MWZZZH_POLL_BATCH_MAX", default=TASKS)
+    # Redis 设备池分库数量（例如 2 => tiktok:device_pool 与 tiktok:device_pool:1）
+    DEVICE_POOL_SHARDS = _get_int_from_env("REDIS_DEVICE_POOL_SHARDS", default=1)
 
     # keep-alive / Session 复用（连接复用 + 达到最大请求数自动淘汰重建）
     # - 默认开启（提升性能，减少握手/建连）
@@ -714,6 +716,7 @@ async def _poll_fill_loop() -> None:
     # 目标数量：统一使用 REDIS_MAX_DEVICES
     target = max(0, int(Config.REDIS_MAX_DEVICES))
     batch_max = max(1, int(Config.POLL_BATCH_MAX))
+    shards = max(1, int(Config.DEVICE_POOL_SHARDS))
 
     if target <= 0:
         logger.critical("[poll] REDIS_MAX_DEVICES 需要 > 0")
@@ -724,28 +727,46 @@ async def _poll_fill_loop() -> None:
     if legacy_target is not None and legacy_target.strip():
         logger.warning("[poll] 检测到已废弃配置 REDIS_TARGET_DEVICES，将忽略并以 REDIS_MAX_DEVICES 为准")
 
-    logger.info(f"[poll] 启动：interval={interval}s target={target} batch_max={batch_max}")
+    base_prefix = os.getenv("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool").strip() or "tiktok:device_pool"
+    logger.info(f"[poll] 启动：interval={interval}s target={target} batch_max={batch_max} shards={shards} base_prefix={base_prefix}")
 
     while True:
         try:
-            # 连接 Redis，读取当前池大小（失败视为致命）
-            rcfg = _get_redis_config(max_devices_default=target)
-            pool = RedisDevicePool(rcfg)
-            pool.ping()
-            cur = pool.count()
+            # 连接 Redis，读取每个池大小（失败视为致命）
+            # 规则：0号池为 base_prefix，其它池为 base_prefix:{idx}
+            pool_counts: list[tuple[int, int, str]] = []
+            for i in range(shards):
+                key_prefix = base_prefix if i == 0 else f"{base_prefix}:{i}"
+                os.environ["REDIS_DEVICE_POOL_KEY"] = key_prefix
+                rcfg = _get_redis_config(max_devices_default=target)
+                pool = RedisDevicePool(rcfg)
+                pool.ping()
+                cur = pool.count()
+                pool_counts.append((cur, i, key_prefix))
         except Exception as e:
             logger.critical(f"[poll] Redis 连接/读取失败，程序终止: {e}")
             raise SystemExit(1)
 
-        missing = target - cur
-        if missing <= 0:
-            logger.info(f"[poll] 设备池充足 cur={cur} target={target}，sleep {interval}s")
+        # 选择一个“未满”的池子进行补齐：优先选择当前数量最少的池
+        pool_counts.sort(key=lambda x: x[0])
+        chosen: tuple[int, int, str] | None = None
+        for cur, idx, prefix in pool_counts:
+            if cur < target:
+                chosen = (cur, idx, prefix)
+                break
+
+        if chosen is None:
+            logger.info(f"[poll] 所有设备池已满（每池 target={target}）sleep {interval}s")
             await asyncio.sleep(interval)
             continue
 
+        cur, idx, key_prefix = chosen
+        missing = target - cur
         fill_n = min(missing, batch_max)
-        logger.info(f"[poll] 设备池不足 cur={cur} target={target} missing={missing} -> 本轮补齐 {fill_n}")
+        logger.info(f"[poll] 选择池 idx={idx} key_prefix={key_prefix} cur={cur} target={target} missing={missing} -> 本轮补齐 {fill_n}")
 
+        # 本轮写入到选中的池子
+        os.environ["REDIS_DEVICE_POOL_KEY"] = key_prefix
         engine = SpiderEngine()
         await engine.run(tasks_n=fill_n)
         # 本轮跑完立即进入下一轮检查（不额外 sleep）

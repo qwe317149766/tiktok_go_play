@@ -10,10 +10,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"runtime"
 )
 
 // Config 配置
@@ -54,168 +56,422 @@ type StatsResult struct {
 	Err error
 }
 
-// ResultWriter 结果写入器 - 高性能版本
+// ResultWriter 结果写入器 - 并行写版本（主任务非阻塞投递）
+// 设计目标：不管成功/失败，都不能干预主任务运行。
+// 策略：主任务写入时使用 non-blocking send；队列满则丢弃并计数（避免卡住主流程）。
 type ResultWriter struct {
-	file  *os.File
-	queue chan TaskResult
+	baseFilename string
+	maxBytes     int64 // 单文件最大字节数（到达后滚动）
+	workers      int
+	queueSize    int
+	dropped      int64
+
+	chans []chan TaskResult
 	wg    sync.WaitGroup
 	done  chan struct{}
-	mu    sync.Mutex
-	batch []TaskResult
+}
+
+type resultWorker struct {
+	id           int
+	baseFilename string
+	maxBytes     int64
+	queue        <-chan TaskResult
+	done         <-chan struct{}
+
+	file         *os.File
+	currentBytes int64
+	part         int
+	batch        []TaskResult
+}
+
+func (rw *ResultWriter) Dropped() int64 {
+	if rw == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&rw.dropped)
+}
+
+func getStatsResultMaxBytes() int64 {
+	// 结果文件最大体积（MB），默认 20MB
+	mb := envInt("STATS_RESULT_MAX_MB", 20)
+	if mb <= 0 {
+		mb = 20
+	}
+	return int64(mb) * 1024 * 1024
+}
+
+func getStatsResultWriterWorkers() int {
+	n := envInt("STATS_RESULT_WRITER_WORKERS", 4)
+	if n <= 0 {
+		return 4
+	}
+	if n > 32 {
+		return 32
+	}
+	return n
+}
+
+func getStatsResultQueueSize() int {
+	n := envInt("STATS_RESULT_QUEUE_SIZE", 20000)
+	if n <= 0 {
+		return 20000
+	}
+	return n
+}
+
+func makePartFilename(base string, workerID int, part int) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = "results.jsonl"
+	}
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	if ext == "" {
+		// 没有扩展名时也保持可读
+		return fmt.Sprintf("%s_w%02d_part%04d", name, workerID, part)
+	}
+	return fmt.Sprintf("%s_w%02d_part%04d%s", name, workerID, part, ext)
+}
+
+func (w *resultWorker) openForPart(part int) error {
+	filename := makePartFilename(w.baseFilename, w.id, part)
+	dir := filepath.Dir(filename)
+	if dir != "." && dir != "" {
+		_ = os.MkdirAll(dir, 0755)
+	}
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	w.file = f
+	w.part = part
+	// 初始化当前文件大小（用于滚动判断）
+	if st, err := f.Stat(); err == nil {
+		w.currentBytes = st.Size()
+	} else {
+		w.currentBytes = 0
+	}
+	return nil
 }
 
 func NewResultWriter(filename string) (*ResultWriter, error) {
-	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return nil, err
-	}
-
 	rw := &ResultWriter{
-		file:  file,
-		queue: make(chan TaskResult, 10000), // 更大的缓冲区
-		done:  make(chan struct{}),
-		batch: make([]TaskResult, 0, 100), // 批量写入
+		baseFilename: filename,
+		maxBytes:     getStatsResultMaxBytes(),
+		workers:      getStatsResultWriterWorkers(),
+		queueSize:    getStatsResultQueueSize(),
+		done:         make(chan struct{}),
 	}
-
-	rw.wg.Add(1)
-	go rw.writer()
+	rw.chans = make([]chan TaskResult, 0, rw.workers)
+	for i := 0; i < rw.workers; i++ {
+		ch := make(chan TaskResult, rw.queueSize)
+		rw.chans = append(rw.chans, ch)
+		w := &resultWorker{
+			id:           i,
+			baseFilename: rw.baseFilename,
+			maxBytes:     rw.maxBytes,
+			queue:        ch,
+			done:         rw.done,
+			batch:        make([]TaskResult, 0, 200),
+		}
+		// 每个 worker 从 part0001 开始写自己的文件
+		if err := w.openForPart(1); err != nil {
+			return nil, err
+		}
+		rw.wg.Add(1)
+		go func(ww *resultWorker) {
+			defer rw.wg.Done()
+			ww.run()
+		}(w)
+	}
 
 	return rw, nil
 }
 
 func (rw *ResultWriter) Write(result TaskResult) {
+	if len(rw.chans) == 0 {
+		return
+	}
+	// 用 TaskID 做分片，保证同一 task 更稳定地落到同一 writer
+	idx := 0
+	if result.TaskID >= 0 {
+		idx = result.TaskID % len(rw.chans)
+	}
 	select {
-	case rw.queue <- result:
-	case <-rw.done:
+	case rw.chans[idx] <- result:
+		// ok
+	default:
+		// 队列满：丢弃，确保不影响主任务
+		atomic.AddInt64(&rw.dropped, 1)
 	}
 }
 
-func (rw *ResultWriter) writer() {
-	defer rw.wg.Done()
-	ticker := time.NewTicker(500 * time.Millisecond) // 更频繁的写入
+func (w *resultWorker) run() {
+	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
-
+	flush := func() {
+		if len(w.batch) == 0 {
+			return
+		}
+		for _, result := range w.batch {
+			data, _ := json.Marshal(result)
+			line := string(data) + "\n"
+			// 到达阈值时滚动到下一个文件（默认 20MB）
+			if w.maxBytes > 0 && w.currentBytes+int64(len(line)) > w.maxBytes {
+				if w.file != nil {
+					_ = w.file.Close()
+				}
+				_ = w.openForPart(w.part + 1)
+			}
+			if w.file != nil {
+				_, _ = w.file.WriteString(line)
+				w.currentBytes += int64(len(line))
+			}
+		}
+		w.batch = w.batch[:0]
+	}
 	for {
 		select {
-		case result := <-rw.queue:
-			rw.mu.Lock()
-			rw.batch = append(rw.batch, result)
-			if len(rw.batch) >= 100 { // 批量写入
-				rw.flush()
+		case r, ok := <-w.queue:
+			if !ok {
+				flush()
+				if w.file != nil {
+					_ = w.file.Close()
+				}
+				return
 			}
-			rw.mu.Unlock()
+			w.batch = append(w.batch, r)
+			if len(w.batch) >= 200 {
+				flush()
+			}
 		case <-ticker.C:
-			rw.mu.Lock()
-			if len(rw.batch) > 0 {
-				rw.flush()
+			flush()
+		case <-w.done:
+			flush()
+			if w.file != nil {
+				_ = w.file.Close()
 			}
-			rw.mu.Unlock()
-		case <-rw.done:
-			rw.mu.Lock()
-			rw.flush()
-			rw.mu.Unlock()
 			return
 		}
 	}
 }
 
-func (rw *ResultWriter) flush() {
-	if len(rw.batch) == 0 {
-		return
-	}
-
-	for _, result := range rw.batch {
-		data, _ := json.Marshal(result)
-		rw.file.WriteString(string(data) + "\n")
-	}
-	rw.batch = rw.batch[:0]
-}
-
 func (rw *ResultWriter) Close() {
 	close(rw.done)
+	// 主任务不应被 Close 阻塞太久，但这里是退出阶段，允许等待落盘
+	for _, ch := range rw.chans {
+		close(ch)
+	}
 	rw.wg.Wait()
-	rw.file.Close()
 }
 
 // ErrorWriter 错误日志写入器
 type ErrorWriter struct {
-	file  *os.File
-	queue chan string
+	baseFilename string
+	maxBytes     int64
+	workers      int
+	queueSize    int
+	dropped      int64
+
+	chans []chan string
 	wg    sync.WaitGroup
 	done  chan struct{}
-	mu    sync.Mutex
-	batch []string
 }
 
 func NewErrorWriter(filename string) (*ErrorWriter, error) {
-	file, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return nil, err
-	}
-
 	ew := &ErrorWriter{
-		file:  file,
-		queue: make(chan string, 1000),
-		done:  make(chan struct{}),
-		batch: make([]string, 0, 50),
+		baseFilename: filename,
+		maxBytes:     getStatsErrorMaxBytes(),
+		workers:      getStatsErrorWriterWorkers(),
+		queueSize:    getStatsErrorQueueSize(),
+		done:         make(chan struct{}),
 	}
-
-	ew.wg.Add(1)
-	go ew.writer()
+	ew.chans = make([]chan string, 0, ew.workers)
+	for i := 0; i < ew.workers; i++ {
+		ch := make(chan string, ew.queueSize)
+		ew.chans = append(ew.chans, ch)
+		w := &errorWorker{
+			id:           i,
+			baseFilename: ew.baseFilename,
+			maxBytes:     ew.maxBytes,
+			queue:        ch,
+			done:         ew.done,
+			batch:        make([]string, 0, 100),
+		}
+		if err := w.openForPart(1); err != nil {
+			return nil, err
+		}
+		ew.wg.Add(1)
+		go func(ww *errorWorker) {
+			defer ew.wg.Done()
+			ww.run()
+		}(w)
+	}
 
 	return ew, nil
 }
 
 func (ew *ErrorWriter) Write(msg string) {
-	select {
-	case ew.queue <- msg:
-	case <-ew.done:
-	}
-}
-
-func (ew *ErrorWriter) writer() {
-	defer ew.wg.Done()
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case msg := <-ew.queue:
-			ew.mu.Lock()
-			ew.batch = append(ew.batch, msg)
-			if len(ew.batch) >= 50 {
-				ew.flush()
-			}
-			ew.mu.Unlock()
-		case <-ticker.C:
-			ew.mu.Lock()
-			if len(ew.batch) > 0 {
-				ew.flush()
-			}
-			ew.mu.Unlock()
-		case <-ew.done:
-			ew.mu.Lock()
-			ew.flush()
-			ew.mu.Unlock()
-			return
-		}
-	}
-}
-
-func (ew *ErrorWriter) flush() {
-	if len(ew.batch) == 0 {
+	if len(ew.chans) == 0 {
 		return
 	}
-	for _, msg := range ew.batch {
-		ew.file.WriteString(msg + "\n")
+	// 简单 hash 分片，避免锁竞争；失败写入不会阻塞主任务
+	h := int(fnv1a32(msg))
+	if h < 0 {
+		h = -h
 	}
-	ew.batch = ew.batch[:0]
+	idx := h % len(ew.chans)
+	select {
+	case ew.chans[idx] <- msg:
+	default:
+		atomic.AddInt64(&ew.dropped, 1)
+	}
 }
 
 func (ew *ErrorWriter) Close() {
 	close(ew.done)
+	for _, ch := range ew.chans {
+		close(ch)
+	}
 	ew.wg.Wait()
-	ew.file.Close()
+}
+
+func (ew *ErrorWriter) Dropped() int64 {
+	if ew == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&ew.dropped)
+}
+
+func getStatsErrorMaxBytes() int64 {
+	// error.log 单文件最大体积（MB），默认 20MB
+	mb := envInt("STATS_ERROR_MAX_MB", 20)
+	if mb <= 0 {
+		mb = 20
+	}
+	return int64(mb) * 1024 * 1024
+}
+
+func getStatsErrorWriterWorkers() int {
+	n := envInt("STATS_ERROR_WRITER_WORKERS", 2)
+	if n <= 0 {
+		return 2
+	}
+	if n > 16 {
+		return 16
+	}
+	return n
+}
+
+func getStatsErrorQueueSize() int {
+	n := envInt("STATS_ERROR_QUEUE_SIZE", 5000)
+	if n <= 0 {
+		return 5000
+	}
+	return n
+}
+
+func fnv1a32(s string) uint32 {
+	var h uint32 = 2166136261
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
+}
+
+type errorWorker struct {
+	id           int
+	baseFilename string
+	maxBytes     int64
+	queue        <-chan string
+	done         <-chan struct{}
+
+	file         *os.File
+	currentBytes int64
+	part         int
+	batch        []string
+}
+
+func makeErrorPartFilename(base string, workerID int, part int) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = "error.log"
+	}
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+	if ext == "" {
+		return fmt.Sprintf("%s_w%02d_part%04d", name, workerID, part)
+	}
+	return fmt.Sprintf("%s_w%02d_part%04d%s", name, workerID, part, ext)
+}
+
+func (w *errorWorker) openForPart(part int) error {
+	filename := makeErrorPartFilename(w.baseFilename, w.id, part)
+	dir := filepath.Dir(filename)
+	if dir != "." && dir != "" {
+		_ = os.MkdirAll(dir, 0755)
+	}
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	w.file = f
+	w.part = part
+	if st, err := f.Stat(); err == nil {
+		w.currentBytes = st.Size()
+	} else {
+		w.currentBytes = 0
+	}
+	return nil
+}
+
+func (w *errorWorker) run() {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	flush := func() {
+		if len(w.batch) == 0 {
+			return
+		}
+		for _, msg := range w.batch {
+			line := msg + "\n"
+			if w.maxBytes > 0 && w.currentBytes+int64(len(line)) > w.maxBytes {
+				if w.file != nil {
+					_ = w.file.Close()
+				}
+				_ = w.openForPart(w.part + 1)
+			}
+			if w.file != nil {
+				_, _ = w.file.WriteString(line)
+				w.currentBytes += int64(len(line))
+			}
+		}
+		w.batch = w.batch[:0]
+	}
+	for {
+		select {
+		case msg, ok := <-w.queue:
+			if !ok {
+				flush()
+				if w.file != nil {
+					_ = w.file.Close()
+				}
+				return
+			}
+			w.batch = append(w.batch, msg)
+			if len(w.batch) >= 100 {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		case <-w.done:
+			flush()
+			if w.file != nil {
+				_ = w.file.Close()
+			}
+			return
+		}
+	}
 }
 
 // ErrorStats 错误统计
@@ -263,6 +519,10 @@ type Engine struct {
 	concurrencyMu      sync.RWMutex
 	minConcurrency     int
 	maxConcurrency     int
+	// 趋势：用“和上一次对比”的成功率来决定是否允许降并发，以及何时升并发
+	lastAdjustTotal      int64
+	lastSuccessRate      float64
+	rateIncreaseStreak   int
 
 	// 退出信号
 	stopChan chan struct{}
@@ -292,18 +552,83 @@ func NewEngine() (*Engine, error) {
 	// 初始化设备缓存
 	InitDeviceCache(cacheFile)
 
+	maxConc := config.MaxConcurrency * 2
+	if maxConc < 1 {
+		maxConc = 1
+	}
+	// 最小并发数：按“配置并发/2”计算（用户要求）
+	minConc := config.MaxConcurrency / 2
+	if minConc < 1 {
+		minConc = 1
+	}
+
 	return &Engine{
-		sem:                make(chan struct{}, config.MaxConcurrency),
+		// 方式A：sem 容量=并发上限（用于硬上限保护），动态并发由 currentConcurrency 门控
+		sem:                make(chan struct{}, maxConc),
 		writer:             writer,
 		errorWriter:        errorWriter,
 		proxyManager:       GetProxyManager(),
 		deviceManager:      GetDeviceManager(),
 		bannedPoolIDs:      make(map[string]bool),
 		currentConcurrency: int64(config.MaxConcurrency),
-		minConcurrency:     50,                        // 最小并发数
-		maxConcurrency:     config.MaxConcurrency * 2, // 最大并发数（2倍初始值）
+		minConcurrency:     minConc,                   // 最小并发数（=配置并发/2）
+		maxConcurrency:     maxConc,                   // 最大并发数（默认 2 倍初始值）
+		lastAdjustTotal:    0,
+		lastSuccessRate:    -1,
+		rateIncreaseStreak: 0,
 		stopChan:           make(chan struct{}),       // 初始化stopChan
 	}, nil
+}
+
+// acquireDynamicPermit：方式A（动态并发门控，真正生效）
+// - sem：硬上限（容量=maxConcurrency）
+// - currentConcurrency：动态允许的并发（<=maxConcurrency）
+func (e *Engine) acquireDynamicPermit() bool {
+	for {
+		// 退出信号
+		select {
+		case <-e.stopChan:
+			return false
+		default:
+		}
+
+		// 先拿硬上限 token（达到 maxConcurrency 时阻塞）
+		e.sem <- struct{}{}
+
+		// 再按 currentConcurrency 动态门控（不满足则释放 token 并短暂 sleep）
+		cur := atomic.LoadInt64(&e.currentConcurrency)
+		if cur <= 0 {
+			cur = 1
+		}
+		if cur > int64(e.maxConcurrency) {
+			cur = int64(e.maxConcurrency)
+		}
+
+		for {
+			select {
+			case <-e.stopChan:
+				<-e.sem
+				return false
+			default:
+			}
+
+			in := atomic.LoadInt64(&e.inflight)
+			if in >= cur {
+				<-e.sem
+				time.Sleep(2 * time.Millisecond)
+				break
+			}
+			if atomic.CompareAndSwapInt64(&e.inflight, in, in+1) {
+				return true
+			}
+			runtime.Gosched()
+		}
+	}
+}
+
+func (e *Engine) releaseDynamicPermit() {
+	atomic.AddInt64(&e.inflight, -1)
+	<-e.sem
 }
 
 // adjustConcurrency 根据成功率动态调整并发数
@@ -319,28 +644,58 @@ func (e *Engine) adjustConcurrency() {
 	e.concurrencyMu.Lock()
 	defer e.concurrencyMu.Unlock()
 
+	// 防止 3 秒一次的进度 tick 波动造成误判：要求与上一次调整相比新增一定样本量
+	const minNewSamples = int64(200)
+	if e.lastAdjustTotal > 0 && total-e.lastAdjustTotal < minNewSamples {
+		return
+	}
+
 	current := int(atomic.LoadInt64(&e.currentConcurrency))
 	newConcurrency := current
 
-	// 根据成功率调整
-	if successRate > 0.8 && current < e.maxConcurrency {
-		// 成功率高，增加并发
-		newConcurrency = current + 10
-		if newConcurrency > e.maxConcurrency {
-			newConcurrency = e.maxConcurrency
+	// 规则（按你的要求）：
+	// - 如果成功率比上一次对比是增加的：则不能减少并发
+	// - 如果成功率持续增加 3 次：则需要增加并发
+	const eps = 0.001 // 防抖（避免浮点噪声触发 streak）
+	if e.lastSuccessRate >= 0 {
+		if successRate > e.lastSuccessRate+eps {
+			e.rateIncreaseStreak++
+			// 连续提升 3 次：提升并发
+			if e.rateIncreaseStreak >= 3 && current < e.maxConcurrency {
+				newConcurrency = current + 10
+				if newConcurrency > e.maxConcurrency {
+					newConcurrency = e.maxConcurrency
+				}
+				// 提升一次后清零 streak，避免每个 tick 都加
+				e.rateIncreaseStreak = 0
+			}
+			// 注意：成功率上升时，绝不下降并发（即使 successRate < 0.5）
+		} else if successRate < e.lastSuccessRate-eps {
+			// 成功率下降：允许下降并发（保留原阈值，避免无意义抖动）
+			e.rateIncreaseStreak = 0
+			if successRate < 0.5 && current > e.minConcurrency {
+				newConcurrency = current - 10
+				if newConcurrency < e.minConcurrency {
+					newConcurrency = e.minConcurrency
+				}
+			}
+		} else {
+			// 基本持平：不调整，不累计
+			e.rateIncreaseStreak = 0
 		}
-	} else if successRate < 0.5 && current > e.minConcurrency {
-		// 成功率低，减少并发
-		newConcurrency = current - 10
-		if newConcurrency < e.minConcurrency {
-			newConcurrency = e.minConcurrency
-		}
+	} else {
+		// 第一次：只记录，不调整
+		e.rateIncreaseStreak = 0
 	}
 
 	if newConcurrency != current {
 		atomic.StoreInt64(&e.currentConcurrency, int64(newConcurrency))
 		// 动态调整并发数（静默处理，不打印日志）
 	}
+
+	// 记录本次用于“下次对比”
+	e.lastSuccessRate = successRate
+	e.lastAdjustTotal = total
 }
 
 func (e *Engine) nextProxy() string {
@@ -807,12 +1162,11 @@ func (e *Engine) taskWrapper(taskID int) {
 			atomic.AddInt64(&e.total, 1)
 		}
 	}()
-	atomic.AddInt64(&e.inflight, 1)
-	defer atomic.AddInt64(&e.inflight, -1)
-
-	// 获取信号量（阻塞方式，因为worker数量=信号量大小，所以不会死锁）
-	e.sem <- struct{}{}
-	defer func() { <-e.sem }()
+	// 方式A：动态并发门控（currentConcurrency 真正生效）
+	if !e.acquireDynamicPermit() {
+		return
+	}
+	defer e.releaseDynamicPermit()
 
 	slot, deviceJSON := e.nextDevice()
 	proxy := e.nextProxy()
@@ -959,9 +1313,19 @@ func (e *Engine) Run() {
 				ckRepl := getCookieReplacedTotal()
 				ckBanned := getBannedCookieCount()
 
-				log.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%% | 错误分类: seed=%d, token=%d, stats=%d, network=%d, parse=%d, other=%d | 设备淘汰: total=%d (fail=%d, play=%d) banned=%d | Cookies更换: total=%d banned=%d",
+				dropRes := int64(0)
+				if e.writer != nil {
+					dropRes = e.writer.Dropped()
+				}
+				dropErr := int64(0)
+				if e.errorWriter != nil {
+					dropErr = e.errorWriter.Dropped()
+				}
+				curConc := atomic.LoadInt64(&e.currentConcurrency)
+
+				log.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%% | 错误分类: seed=%d, token=%d, stats=%d, network=%d, parse=%d, other=%d | 设备淘汰: total=%d (fail=%d, play=%d) banned=%d | Cookies更换: total=%d banned=%d | 并发(动态)=%d/%d | 写入丢弃: results=%d error=%d",
 					success, failed, total, rate, seedErr, tokenErr, statsErr, networkErr, parseErr, otherErr,
-					evAll, evFail, evPlay, bannedN, ckRepl, ckBanned)
+					evAll, evFail, evPlay, bannedN, ckRepl, ckBanned, curConc, int64(e.maxConcurrency), dropRes, dropErr)
 				// 动态调整并发数
 				e.adjustConcurrency()
 
@@ -981,8 +1345,8 @@ func (e *Engine) Run() {
 		}
 	}()
 
-	// 使用worker pool模式
-	for i := 0; i < config.MaxConcurrency; i++ {
+	// 使用worker pool模式：启动到并发上限，让 currentConcurrency 真正可以“向上扩容/向下收缩”
+	for i := 0; i < e.maxConcurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -995,19 +1359,9 @@ func (e *Engine) Run() {
 				}
 
 				success := atomic.LoadInt64(&e.success)
-				inflight := atomic.LoadInt64(&e.inflight)
-				total := atomic.LoadInt64(&e.total)
-
-				// 提前停止：避免达到目标后仍然继续发起一整轮并发请求
-				if config.TargetSuccess > 0 && success+inflight >= config.TargetSuccess {
-					e.stopOnce.Do(func() {
-						if e.stopChan != nil {
-							close(e.stopChan)
-						}
-					})
-					return
-				}
-				if success >= config.TargetSuccess || total >= config.MaxRequests {
+				// 需求：去掉“提前判断总数(total>=MaxRequests)”的逻辑，让 total 允许超一轮；
+				// 统一由进度 ticker（每3秒）按 total>=MaxRequests 触发停止即可。
+				if success >= config.TargetSuccess {
 					e.stopOnce.Do(func() {
 						if e.stopChan != nil {
 							close(e.stopChan)
@@ -1074,6 +1428,7 @@ func loadLines(filename string) ([]string, error) {
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	loadEnvForDemo()
+	applyRedisPoolShardFromArgs(os.Args)
 
 	// 并发数：从 env 读取（统一配置）
 	// 优先级：STATS_CONCURRENCY > GEN_CONCURRENCY > 代码默认值
@@ -1203,6 +1558,64 @@ func main() {
 	}
 	engine.Run()
 	// 总耗时已在Run()方法中打印
+}
+
+// applyRedisPoolShardFromArgs 支持按脚本参数切换 Redis 设备池/ cookies 池：
+// - go run . 1 1  => 使用 tiktok:device_pool:1 与 tiktok:startup_cookie_pool:1
+// - 不传参       => 默认 0 号（不加后缀，保持 tiktok:device_pool / tiktok:startup_cookie_pool）
+//
+// “库数量”可通过配置限制：
+// - REDIS_DEVICE_POOL_SHARDS（默认 1）
+// - REDIS_COOKIE_POOL_SHARDS（默认 1）
+func applyRedisPoolShardFromArgs(args []string) {
+	deviceIdx := 0
+	cookieIdx := 0
+	if len(args) >= 2 {
+		if n, err := strconv.Atoi(strings.TrimSpace(args[1])); err == nil && n >= 0 {
+			deviceIdx = n
+		}
+	}
+	if len(args) >= 3 {
+		if n, err := strconv.Atoi(strings.TrimSpace(args[2])); err == nil && n >= 0 {
+			cookieIdx = n
+		}
+	}
+
+	devShards := envInt("REDIS_DEVICE_POOL_SHARDS", 1)
+	ckShards := envInt("REDIS_COOKIE_POOL_SHARDS", 1)
+	if devShards <= 0 {
+		devShards = 1
+	}
+	if ckShards <= 0 {
+		ckShards = 1
+	}
+	if deviceIdx >= devShards {
+		log.Printf("[pool] devicePoolIdx=%d 超出 REDIS_DEVICE_POOL_SHARDS=%d，自动回退为 0", deviceIdx, devShards)
+		deviceIdx = 0
+	}
+	if cookieIdx >= ckShards {
+		log.Printf("[pool] cookiePoolIdx=%d 超出 REDIS_COOKIE_POOL_SHARDS=%d，自动回退为 0", cookieIdx, ckShards)
+		cookieIdx = 0
+	}
+
+	baseDev := envStr("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool")
+	baseCk := envStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")
+
+	devKey := baseDev
+	if deviceIdx > 0 {
+		devKey = fmt.Sprintf("%s:%d", baseDev, deviceIdx)
+	}
+	ckKey := baseCk
+	if cookieIdx > 0 {
+		ckKey = fmt.Sprintf("%s:%d", baseCk, cookieIdx)
+	}
+
+	// 覆盖进程内 env：后续所有 Redis 读写都将使用该前缀
+	_ = os.Setenv("REDIS_DEVICE_POOL_KEY", devKey)
+	_ = os.Setenv("REDIS_STARTUP_COOKIE_POOL_KEY", ckKey)
+
+	log.Printf("[pool] selected devicePoolIdx=%d/%d key=%s | cookiePoolIdx=%d/%d key=%s",
+		deviceIdx, devShards, devKey, cookieIdx, ckShards, ckKey)
 }
 
 // findTopmostFileUpwards 从当前目录开始向上查找文件，返回“最顶层”的那个路径（更接近仓库根目录）。

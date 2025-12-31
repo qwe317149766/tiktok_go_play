@@ -22,6 +22,7 @@ func (s *Server) routesAdmin(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/cookies/import", s.handleAdminImportCookies)
 	mux.HandleFunc("/admin/cookies/clear", s.handleAdminClearCookies)
 	mux.HandleFunc("/admin/cookies/stats", s.handleAdminCookiesStats)
+	mux.HandleFunc("/admin/pools/stats", s.handleAdminPoolsStats)
 }
 
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request) {
@@ -112,6 +113,16 @@ const adminHTML = `<!doctype html>
       </div>
 
       <div class="card">
+        <h2>池子统计（分库）</h2>
+        <p class="small">自动按 <code>REDIS_DEVICE_POOL_SHARDS</code> / <code>REDIS_COOKIE_POOL_SHARDS</code> 展示每个池子的数量。</p>
+        <div class="row">
+          <button id="poolRefresh" type="button">刷新</button>
+          <span class="small" id="poolHint"></span>
+        </div>
+        <div id="poolOut" class="out"></div>
+      </div>
+
+      <div class="card">
         <h2>新增/追加 API Key 额度</h2>
         <form method="post" action="/admin/api_keys/add">
           <label>管理员密码</label>
@@ -132,7 +143,7 @@ const adminHTML = `<!doctype html>
 
       <div class="card">
         <h2>批量导入设备到 Redis</h2>
-        <p class="small">支持粘贴 JSONL（每行一个设备 JSON）。模式：<code>overwrite</code>=全覆盖；<code>evict</code>=按淘汰策略腾位置。若容量不足，会在结果里返回“剩余设备”。</p>
+        <p class="small">支持文件上传或粘贴 JSONL（每行一个设备 JSON）。会按 <code>REDIS_DEVICE_POOL_SHARDS</code> 自动分配到各个设备池。模式：<code>overwrite</code>=全覆盖；<code>evict</code>=按淘汰策略腾位置。若容量不足，会在结果里返回“剩余设备”。</p>
         <form id="devForm">
           <label>管理员密码</label>
           <input name="password" type="password" autocomplete="current-password" required />
@@ -142,6 +153,9 @@ const adminHTML = `<!doctype html>
             <option value="evict">evict（按淘汰策略）</option>
             <option value="overwrite">overwrite（全覆盖）</option>
           </select>
+
+          <label>设备文件（可选，优先于下方文本）</label>
+          <input name="devices_file" type="file" accept=".txt,.json,.jsonl,text/plain,application/json" />
 
           <label>设备 JSONL（每行一个 JSON）</label>
           <textarea name="devices" placeholder='{"cdid":"...","create_time":"2025-12-31 01:11:00", ...}' required></textarea>
@@ -157,7 +171,7 @@ const adminHTML = `<!doctype html>
 
       <div class="card">
         <h2>批量导入 Cookies 到 Redis（startUp cookie 池）</h2>
-        <p class="small">写入 <code>REDIS_STARTUP_COOKIE_POOL_KEY</code>（结构：<code>:ids</code> + <code>:data</code>），stats/startUp 都能直接用。支持每行一条：<code>k=v; k2=v2</code> 或 JSON <code>{"k":"v"}</code>。</p>
+        <p class="small">支持文件上传或粘贴（每行一条）。会按 <code>REDIS_COOKIE_POOL_SHARDS</code> 自动分配到各个 cookies 池。格式：<code>k=v; k2=v2</code> 或 JSON <code>{"k":"v"}</code>。</p>
         <form id="ckForm">
           <label>管理员密码</label>
           <input name="password" type="password" autocomplete="current-password" required />
@@ -169,10 +183,13 @@ const adminHTML = `<!doctype html>
             <option value="overwrite">overwrite（全覆盖）</option>
           </select>
 
+          <label>Cookies 文件（可选，优先于下方文本）</label>
+          <input name="cookies_file" type="file" accept=".txt,.json,.jsonl,text/plain,application/json" />
+
           <label>Cookies（每行一条）</label>
           <textarea name="cookies" placeholder='sessionid=...; sid_tt=...&#10;{"sessionid":"...","sid_tt":"..."}' required></textarea>
 
-          <button type="submit">导入到内存</button>
+          <button type="submit">导入到 Redis</button>
         </form>
         <div class="row" style="margin-top:10px;">
           <button id="ckClear" type="button">清空 Redis Cookies</button>
@@ -192,6 +209,26 @@ async function postForm(url, formEl) {
   try { data = JSON.parse(text); } catch (e) {}
   return { ok: resp.ok, status: resp.status, text, data };
 }
+
+// pool stats
+const poolOut = document.getElementById("poolOut");
+const poolHint = document.getElementById("poolHint");
+async function refreshPools() {
+  poolOut.textContent = "loading...";
+  const resp = await fetch("/admin/pools/stats");
+  const t = await resp.text();
+  try {
+    const d = JSON.parse(t);
+    poolOut.textContent = JSON.stringify(d, null, 2);
+    poolHint.textContent = "ok";
+  } catch (e) {
+    poolOut.textContent = t;
+    poolHint.textContent = "error";
+  }
+}
+document.getElementById("poolRefresh").addEventListener("click", refreshPools);
+setInterval(refreshPools, 5000);
+refreshPools();
 
 // devices
 const devForm = document.getElementById("devForm");
