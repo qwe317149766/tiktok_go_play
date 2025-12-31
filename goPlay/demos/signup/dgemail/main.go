@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,6 +48,8 @@ func main() {
 
 	// 载入 env（优先读取 dgemail 目录或仓库根目录的 env.windows/env.linux）
 	loadEnvForDemo()
+	// 支持按启动参数切分库（与 stats 一致）：go run . <deviceIdx> [cookieIdx]
+	applyRedisPoolShardFromArgs(os.Args)
 
 	// 轮询补齐模式：检查 Redis cookies 池缺口，自动补齐（Linux 默认开启；Windows 可用 DGEMAIL_POLL_MODE=1 调试）
 	if dgemailPollEnabled() {
@@ -81,7 +82,23 @@ func main() {
 		}
 		fmt.Printf("已从Redis加载 %d 个设备\n", len(devices))
 	} else {
-		devices, err = loadDevices("data/devices.txt")
+		// 设备文件路径（文件模式）
+		// 优先级：
+		// - DEVICES_FILE（统一配置，推荐）
+		// - SIGNUP_DEVICES_FILE（signup 专用，兼容）
+		// - 向上查找仓库根目录的 devices.txt
+		// - 旧默认：data/devices.txt
+		devPath := strings.TrimSpace(getEnvStr("DEVICES_FILE", ""))
+		if devPath == "" {
+			devPath = strings.TrimSpace(getEnvStr("SIGNUP_DEVICES_FILE", ""))
+		}
+		if devPath == "" {
+			devPath = findTopmostFileUpwards("devices.txt", 8)
+		}
+		if devPath == "" {
+			devPath = "data/devices.txt"
+		}
+		devices, err = loadDevices(devPath)
 		if err != nil {
 			log.Fatalf("读取设备列表失败: %v", err)
 		}
@@ -116,8 +133,8 @@ func main() {
 		if target > len(devices) && len(devices) > 0 {
 			fmt.Printf("⚠️  STARTUP_REGISTER_COUNT=%d 大于设备数量=%d，将循环复用设备进行注册\n", target, len(devices))
 		}
-		accounts = generateRandomAccounts(target)
-		fmt.Printf("已生成 %d 个随机账号（来自 STARTUP_REGISTER_COUNT/MAX_GENERATE）\n", len(accounts))
+		accounts = generateUniqueAccounts(target)
+		fmt.Printf("已生成 %d 个账号（不重复，来自 STARTUP_REGISTER_COUNT/MAX_GENERATE）\n", len(accounts))
 	} else {
 		fmt.Printf("已加载 %d 个账号\n", len(accounts))
 	}
@@ -142,6 +159,11 @@ func main() {
 	fmt.Printf("并发数: %d (来自 SIGNUP_CONCURRENCY)\n", maxConcurrency)
 	fmt.Println()
 
+	// 启动“账号池实时写入”后台协程（注册成功就写入 startup_cookie_pool），避免 stats 等到整批结束
+	if s := getStartupAccountStream(); s != nil {
+		defer s.Stop()
+	}
+
 	// 5. 开始并发注册
 	startTime := time.Now()
 	registerAccounts(accounts, devices, proxies, maxConcurrency)
@@ -160,33 +182,32 @@ func main() {
 	saveSuccessAccounts("res/success_accounts.txt")
 	saveFailedAccounts("res/failed_accounts.txt")
 	saveDevicesWithCookies("res/devices1221/devices12_21_3.txt", devices)
+	// 7.1 固定目录 JSONL 日志（例如 results_w01_part0002.jsonl）
+	saveResultsJSONLFixed()
 
-	// 8. （可选）将 startUp 注册成功的 cookies 写入 Redis，供 stats 项目读取
-	if n, err := saveStartupCookiesToRedis(results, 0); err != nil {
+	// 8. 组装“注册成功账号数据”（设备字段 + cookies 字段）
+	// 注意：你要求 stats 直接从账号池读取设备+cookies，因此这里的账号数据是后续写入 startup_cookie_pool 的内容。
+	startupDevs := buildStartupDevicesWithCookies(devices, results)
+
+	// 9. （可选）将 startUp 注册成功的“账号池数据”写入 Redis（使用 startup_cookie_pool 的 key 结构）
+	if n, err := saveStartupCookiesToRedis(startupDevs, 0); err != nil {
 		log.Fatalf("写入startUp cookies到Redis失败: %v", err)
 	} else if n > 0 {
-		fmt.Printf("已写入 %d 份 startUp cookies 到 Redis\n", n)
+		fmt.Printf("已写入 %d 份 startUp 账号数据 到 Redis(REDIS_STARTUP_COOKIE_POOL_KEY)\n", n)
+	}
+
+	// 10. （可选）将 startUp 注册成功的 devices 写入 Redis 设备池（兼容旧逻辑/备用，不再作为 stats 的默认来源）
+	if n, err := saveStartupDevicesToRedis(startupDevs); err != nil {
+		log.Fatalf("写入startUp devices到Redis失败: %v", err)
+	} else if n > 0 {
+		fmt.Printf("已写入 %d 个 startUp devices 到 Redis 设备池(%s)\n", n, getEnvStr("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool"))
 	}
 }
 
 // generateRandomAccounts 生成随机账号
 func generateRandomAccounts(count int) []AccountInfo {
-	rand.Seed(time.Now().UnixNano())
-	accounts := make([]AccountInfo, count)
-
-	for i := 0; i < count; i++ {
-		// 生成随机字符串作为邮箱用户名（8-12位）
-		usernameLength := rand.Intn(5) + 8
-		username := generateRandomString(usernameLength)
-		email := fmt.Sprintf("wazss%s@gmail.com", username)
-
-		accounts[i] = AccountInfo{
-			Email:    email,
-			Password: "qw123456789!", // 固定密码
-		}
-	}
-
-	return accounts
+	// 兼容旧代码：保留函数名，但内部改为“尽量不重复”生成（优先用 Redis 序号）
+	return generateUniqueAccounts(count)
 }
 
 // generateRandomString 生成随机字符串
@@ -389,6 +410,19 @@ func registerAccounts(accounts []AccountInfo, devices []map[string]interface{}, 
 			atomic.AddInt64(&totalCount, 1)
 			if result.Success {
 				atomic.AddInt64(&successCount, 1)
+				// ✅ 注册成功立刻把“完整账号 JSON（设备字段+cookies字段）”写入账号池，避免 stats 等到整批结束
+				if startupAccountStreamEnabled() && len(result.Cookies) > 0 {
+					// 复制 deviceRaw，避免并发读写
+					accJSON := make(map[string]interface{}, len(deviceRaw)+2)
+					for k, v := range deviceRaw {
+						accJSON[k] = v
+					}
+					if _, ok := accJSON["create_time"]; !ok {
+						accJSON["create_time"] = time.Now().Format("2006-01-02 15:04:05")
+					}
+					accJSON["cookies"] = convertCookiesToPythonDict(result.Cookies)
+					enqueueStartupAccountForRedis(accJSON)
+				}
 			} else {
 				atomic.AddInt64(&failedCount, 1)
 			}
@@ -613,9 +647,8 @@ func saveFailedAccounts(filename string) {
 	fmt.Printf("失败账号已保存到: %s\n", filename)
 }
 
-// saveDevicesWithCookies 保存设备信息（提取指定字段）并填充cookies
+// saveDevicesWithCookies 保存 startUp 注册成功的设备信息（保留原始字段）并填充 cookies
 // 格式：每行一个设备的JSON字符串，追加到文件
-// 按照用户要求的字段顺序和类型保存
 func saveDevicesWithCookies(filename string, devices []map[string]interface{}) {
 	resultMutex.Lock()
 	defer resultMutex.Unlock()
@@ -630,8 +663,25 @@ func saveDevicesWithCookies(filename string, devices []map[string]interface{}) {
 	writer := bufio.NewWriter(file)
 	defer writer.Flush()
 
-	// 遍历所有成功注册的结果，提取对应设备的字段并保存
-	for _, result := range results {
+	for _, newDevice := range buildStartupDevicesWithCookies(devices, results) {
+		jsonBytes, err := json.Marshal(newDevice)
+		if err != nil {
+			log.Printf("序列化设备失败: %v", err)
+			continue
+		}
+		writer.WriteString(string(jsonBytes) + "\n")
+	}
+
+	fmt.Printf("设备信息已保存到: %s\n", filename)
+}
+
+// buildStartupDevicesWithCookies 将“注册成功结果”映射回 devices 原始数据，并组装为 startUp 设备行：
+// - 保留 devices 原始 JSON 的全部字段（例如 ua/resolution/dpi/device_type/...）
+// - 追加/覆盖 cookies 字段（来自注册成功结果）
+// - 确保 create_time 字段存在（优先用原始设备的 create_time；若缺失则写入当前时间）
+func buildStartupDevicesWithCookies(devices []map[string]interface{}, regs []RegisterResult) []map[string]interface{} {
+	out := make([]map[string]interface{}, 0, len(regs))
+	for _, result := range regs {
 		if !result.Success || result.DeviceID == "" {
 			continue
 		}
@@ -657,123 +707,30 @@ func saveDevicesWithCookies(filename string, devices []map[string]interface{}) {
 				break
 			}
 		}
-
 		if deviceRaw == nil {
 			continue
 		}
 
-		// 构建新的设备字典，按照用户要求的顺序
-		newDevice := make(map[string]interface{})
-
-		// 提取指定字段，保持原始类型（数字保持为数字）
-		if val, ok := deviceRaw["create_time"]; ok {
-			newDevice["create_time"] = val
+		// 复制原始设备字段（避免直接修改 deviceRaw）
+		newDevice := make(map[string]interface{}, len(deviceRaw)+2)
+		for k, v := range deviceRaw {
+			newDevice[k] = v
 		}
-		if val, ok := deviceRaw["device_id"]; ok {
-			newDevice["device_id"] = val
-		}
-		if val, ok := deviceRaw["install_id"]; ok {
-			newDevice["install_id"] = val
-		}
-		if val, ok := deviceRaw["clientudid"]; ok {
-			newDevice["clientudid"] = val
-		}
-		if val, ok := deviceRaw["google_aid"]; ok {
-			newDevice["google_aid"] = val
-		}
-		// 数字字段保持为数字类型（int64）
-		if val, ok := deviceRaw["apk_last_update_time"]; ok {
-			var intVal int64
-			switch v := val.(type) {
-			case float64:
-				// JSON数字会被解析为float64
-				intVal = int64(v)
-			case int64:
-				intVal = v
-			case int:
-				intVal = int64(v)
-			case string:
-				// 如果是字符串，尝试转换为数字
-				if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
-					intVal = parsed
-				} else {
-					// 转换失败，保持原值
-					newDevice["apk_last_update_time"] = val
-					intVal = -1 // 标记为无效
-				}
-			default:
-				// 其他类型保持原值
-				newDevice["apk_last_update_time"] = val
-				intVal = -1 // 标记为无效
-			}
-			if intVal >= 0 {
-				newDevice["apk_last_update_time"] = intVal
-			}
-		}
-		if val, ok := deviceRaw["apk_first_install_time"]; ok {
-			var intVal int64
-			switch v := val.(type) {
-			case float64:
-				// JSON数字会被解析为float64
-				intVal = int64(v)
-			case int64:
-				intVal = v
-			case int:
-				intVal = int64(v)
-			case string:
-				// 如果是字符串，尝试转换为数字
-				if parsed, err := strconv.ParseInt(v, 10, 64); err == nil {
-					intVal = parsed
-				} else {
-					// 转换失败，保持原值
-					newDevice["apk_first_install_time"] = val
-					intVal = -1 // 标记为无效
-				}
-			default:
-				// 其他类型保持原值
-				newDevice["apk_first_install_time"] = val
-				intVal = -1 // 标记为无效
-			}
-			if intVal >= 0 {
-				newDevice["apk_first_install_time"] = intVal
-			}
-		}
-		if val, ok := deviceRaw["cdid"]; ok {
-			newDevice["cdid"] = val
-		}
-		if val, ok := deviceRaw["openudid"]; ok {
-			newDevice["openudid"] = val
-		}
-		if val, ok := deviceRaw["device_guard_data0"]; ok {
-			newDevice["device_guard_data0"] = val
-		}
-		if val, ok := deviceRaw["tt_ticket_guard_public_key"]; ok {
-			newDevice["tt_ticket_guard_public_key"] = val
-		}
-		if val, ok := deviceRaw["priv_key"]; ok {
-			newDevice["priv_key"] = val
+		// 确保 create_time 存在
+		if _, ok := newDevice["create_time"]; !ok {
+			newDevice["create_time"] = time.Now().Format("2006-01-02 15:04:05")
 		}
 
 		// 填充 cookies（注册成功的结果）
 		if result.Cookies != nil {
-			// 将 cookies map 转换为 Python 字典格式的字符串
-			cookiesStr := convertCookiesToPythonDict(result.Cookies)
-			newDevice["cookies"] = cookiesStr
+			newDevice["cookies"] = convertCookiesToPythonDict(result.Cookies)
 		} else {
 			newDevice["cookies"] = ""
 		}
 
-		// 转换为 JSON 并写入文件
-		jsonBytes, err := json.Marshal(newDevice)
-		if err != nil {
-			log.Printf("序列化设备失败: %v", err)
-			continue
-		}
-
-		writer.WriteString(string(jsonBytes) + "\n")
+		out = append(out, newDevice)
 	}
-
-	fmt.Printf("设备信息已保存到: %s\n", filename)
+	return out
 }
 
 // convertCookiesToPythonDict 将 cookies map 转换为 Python 字典格式的字符串

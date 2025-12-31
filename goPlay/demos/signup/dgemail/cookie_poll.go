@@ -62,16 +62,14 @@ func getCookiePoolShards() int {
 }
 
 func getStartupCookiePoolCount(prefix string) (int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// 轮询模式在高并发/Redis 负载高时，SCARD 也可能变慢；统一用更大的 load timeout
+	ctx, cancel := context.WithTimeout(context.Background(), redisLoadTimeout())
 	defer cancel()
 	rdb, err := newRedisClient()
 	if err != nil {
 		return 0, fmt.Errorf("redis init: %w", err)
 	}
 	defer rdb.Close()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		return 0, fmt.Errorf("redis ping: %w", err)
-	}
 	idsKey := strings.TrimSpace(prefix) + ":ids"
 	n, err := rdb.SCard(ctx, idsKey).Result()
 	if err != nil {
@@ -92,11 +90,16 @@ func runCookiePollLoop() {
 	interval := dgemailPollIntervalSec()
 	batchMax := dgemailPollBatchMax()
 	shards := getCookiePoolShards()
-	basePrefix := strings.TrimSpace(getEnvStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool"))
-	if basePrefix == "" {
-		basePrefix = "tiktok:startup_cookie_pool"
+	baseCookiePrefix := normalizePoolBase(getEnvStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool"))
+	if baseCookiePrefix == "" {
+		baseCookiePrefix = "tiktok:startup_cookie_pool"
 	}
-	log.Printf("[poll] 启动：interval=%ds target=%d batch_max=%d shards=%d base_prefix=%s", interval, target, batchMax, shards, basePrefix)
+	baseDevPrefix := normalizePoolBase(getEnvStr("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool"))
+	if baseDevPrefix == "" {
+		baseDevPrefix = "tiktok:device_pool"
+	}
+	log.Printf("[poll] 启动：interval=%ds target=%d batch_max=%d shards=%d cookie_base=%s device_base=%s",
+		interval, target, batchMax, shards, baseCookiePrefix, baseDevPrefix)
 
 	// 预加载设备与代理（减少每轮开销）
 	var devices []map[string]interface{}
@@ -109,11 +112,33 @@ func runCookiePollLoop() {
 		}
 		log.Printf("[poll] 已从Redis加载 %d 个设备", len(devices))
 	} else {
-		devices, err = loadDevices("data/devices.txt")
+		// 设备文件路径（文件模式）对齐 main.go：
+		// 优先级：
+		// - DEVICES_FILE（统一配置，推荐）
+		// - SIGNUP_DEVICES_FILE（signup 专用，兼容）
+		// - 向上查找仓库根目录的 devices.txt
+		// - 旧默认：data/devices.txt
+		devPath := strings.TrimSpace(getEnvStr("DEVICES_FILE", ""))
+		if devPath == "" {
+			devPath = strings.TrimSpace(getEnvStr("SIGNUP_DEVICES_FILE", ""))
+		}
+		if devPath == "" {
+			devPath = findTopmostFileUpwards("devices.txt", 8)
+		}
+		if devPath == "" {
+			devPath = "data/devices.txt"
+		}
+		devices, err = loadDevices(devPath)
 		if err != nil {
 			log.Fatalf("[poll] 读取设备列表失败: %v", err)
 		}
-		log.Printf("[poll] 已从文件加载 %d 个设备", len(devices))
+		// 设备最小年龄筛选（create_time 早于 N 小时）
+		if h := getSignupDeviceMinAgeHours(); h > 0 {
+			devices = filterDevicesByMinAge(devices, h)
+			log.Printf("[poll] 已从文件加载 %d 个设备（create_time 早于 %d 小时）", len(devices), h)
+		} else {
+			log.Printf("[poll] 已从文件加载 %d 个设备", len(devices))
+		}
 	}
 	if len(devices) == 0 {
 		log.Fatalf("[poll] 设备列表为空，无法补齐 cookies")
@@ -142,16 +167,24 @@ func runCookiePollLoop() {
 			prefix string
 		}
 		var pools []poolInfo
+		scanOK := true
 		for i := 0; i < shards; i++ {
-			prefix := basePrefix
+			prefix := baseCookiePrefix
 			if i > 0 {
-				prefix = fmt.Sprintf("%s:%d", basePrefix, i)
+				prefix = fmt.Sprintf("%s:%d", baseCookiePrefix, i)
 			}
 			cur, err := getStartupCookiePoolCount(prefix)
 			if err != nil {
-				log.Fatalf("[poll] Redis 读取 cookies 池数量失败（致命）prefix=%s err=%v", prefix, err)
+				// 轮询模式不应因临时 Redis 抖动直接退出：记录后 sleep，下一轮重试
+				log.Printf("[poll] Redis 读取 cookies 池数量失败 prefix=%s err=%v；sleep %ds 后重试", prefix, err, interval)
+				scanOK = false
+				break
 			}
 			pools = append(pools, poolInfo{cur: cur, idx: i, prefix: prefix})
+		}
+		if !scanOK {
+			time.Sleep(time.Duration(interval) * time.Second)
+			continue
 		}
 		// 找最少且未满
 		chosen := poolInfo{cur: 0, idx: -1, prefix: ""}
@@ -178,9 +211,12 @@ func runCookiePollLoop() {
 
 		// 本轮写入到选中的 cookies 池
 		_ = os.Setenv("REDIS_STARTUP_COOKIE_POOL_KEY", chosen.prefix)
+	// device 池默认不分库：保持不变，只按 cookies 分库补齐
+	log.Printf("[poll] 本轮写入 cookie_shard=%d -> cookie_prefix=%s | device_prefix=%s(不分库)",
+		chosen.idx, chosen.prefix, baseDevPrefix)
 
-		// 每轮都用随机账号（避免复用 accounts.txt 造成重复/耗尽）
-		accounts := generateRandomAccounts(fill)
+		// 每轮都用不重复账号（避免复用/重复导致注册失败）
+		accounts := generateUniqueAccounts(fill)
 
 		// 重置全局结果，避免轮询模式下内存增长
 		atomicStoreZero()
@@ -191,10 +227,22 @@ func runCookiePollLoop() {
 		duration := time.Since(startTime)
 
 		// 本轮写入 Redis（强制按 fill 写入上限）
-		if n, err := saveStartupCookiesToRedis(results, fill); err != nil {
-			log.Fatalf("[poll] 写入startUp cookies到Redis失败（致命）: %v", err)
+		// 写“账号池数据”（完整设备字段 + cookies 字段）
+		startupAccounts := buildStartupDevicesWithCookies(devices, results)
+		if n, err := saveStartupCookiesToRedis(startupAccounts, fill); err != nil {
+			log.Printf("[poll] 写入startUp cookies到Redis失败: %v；sleep %ds 后重试", err, interval)
+			time.Sleep(time.Duration(interval) * time.Second)
+			continue
 		} else {
 			log.Printf("[poll] 本轮写入 cookies=%d（目标补齐=%d）耗时=%v 成功=%d 失败=%d pool_idx=%d", n, fill, duration, atomicLoadSuccess(), atomicLoadFailed(), chosen.idx)
+		}
+
+		// 同步把本轮“注册成功的设备”也写入 Redis 设备池（供 stats 从 Redis 取设备）
+		startupDevs := startupAccounts
+		if dn, derr := saveStartupDevicesToRedis(startupDevs); derr != nil {
+			log.Printf("[poll] 写入startUp devices到Redis失败: %v；本轮 cookies 已写入，继续下一轮", derr)
+		} else if dn > 0 {
+			log.Printf("[poll] 本轮写入 devices=%d 到 Redis 设备池(%s)", dn, getEnvStr("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool"))
 		}
 		// 立即进入下一轮检查（不额外 sleep）
 	}

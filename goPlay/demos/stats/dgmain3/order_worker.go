@@ -111,7 +111,8 @@ LIMIT 1`, staleSec).Scan(&o.ID, &o.OrderID, &o.APIKey, &o.AwemeID, &o.Quantity, 
 		// 尝试抢单：只有满足条件时才更新成功（RowsAffected=1）
 		res, err := db.ExecContext(ctx, `
 UPDATE orders
-SET status='In progress'
+SET status='In progress',
+    updated_at=NOW()
 WHERE id=?
   AND delivered < quantity
   AND (
@@ -145,7 +146,8 @@ func updateOrderDelivered(ctx context.Context, db *sql.DB, orderID string, delta
 	_, err := db.ExecContext(ctx, `
 UPDATE orders
 SET delivered = LEAST(quantity, delivered + ?),
-    status = CASE WHEN LEAST(quantity, delivered + ?) >= quantity THEN 'Completed' ELSE 'In progress' END
+    status = CASE WHEN LEAST(quantity, delivered + ?) >= quantity THEN 'Completed' ELSE 'In progress' END,
+    updated_at=NOW()
 WHERE order_id = ?`, delta, delta, orderID)
 	return err
 }
@@ -160,7 +162,8 @@ UPDATE orders
 SET delivered = GREATEST(delivered, LEAST(quantity, ?)),
     status = CASE WHEN GREATEST(delivered, LEAST(quantity, ?)) >= quantity THEN 'Completed'
                   WHEN GREATEST(delivered, LEAST(quantity, ?)) > 0 THEN 'In progress'
-                  ELSE status END
+                  ELSE status END,
+    updated_at=NOW()
 WHERE order_id = ?`, delivered, delivered, delivered, orderID)
 	return err
 }
@@ -180,7 +183,7 @@ func finalizeOrderStatus(ctx context.Context, db *sql.DB, orderID string) error 
 		// 本轮没有任何成功：释放订单，让其它进程继续抢
 		newStatus = "Pending"
 	}
-	_, err := db.ExecContext(ctx, `UPDATE orders SET status=? WHERE order_id=?`, newStatus, orderID)
+	_, err := db.ExecContext(ctx, `UPDATE orders SET status=?, updated_at=NOW() WHERE order_id=?`, newStatus, orderID)
 	return err
 }
 

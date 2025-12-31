@@ -5,4 +5,6 @@ dgmain3.exe
 error.log
 devices.txt
 results.jsonl
+*.jsonl
+results_w01_part0001.*
 # src/  # 注释掉，允许frontend/src目录被跟踪

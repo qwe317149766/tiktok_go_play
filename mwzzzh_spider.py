@@ -62,6 +62,21 @@ def _parse_bool(v: str | None, default: bool) -> bool:
         return False
     return default
 
+def _normalize_pool_base(prefix: str) -> str:
+    """
+    统一设备池前缀为“不分库”版本：
+    - 若传入形如 "tiktok:device_pool:3"，则回退为 "tiktok:device_pool"
+    - 其它保持不变
+    """
+    prefix = (prefix or "").strip()
+    if not prefix:
+        return prefix
+    parts = prefix.split(":")
+    if len(parts) >= 2 and parts[-1].isdigit():
+        base = ":".join(parts[:-1]).strip()
+        return base or prefix
+    return prefix
+
 def _get_int_from_env(*names: str, default: int) -> int:
     """
     按优先级读取多个环境变量中的第一个“可解析为 int”的值。
@@ -117,7 +132,9 @@ def _get_redis_config(max_devices_default: int) -> RedisConfig:
     username = os.getenv("REDIS_USERNAME") or None
     password = os.getenv("REDIS_PASSWORD") or None
     ssl = _parse_bool(os.getenv("REDIS_SSL"), False)
-    key_prefix = os.getenv("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool")
+    # Python 设备池：按你的要求“固定不分库”
+    # 即便环境变量误配为 "tiktok:device_pool:<idx>"，这里也会自动去掉后缀
+    key_prefix = _normalize_pool_base(os.getenv("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool"))
     id_field = os.getenv("REDIS_DEVICE_ID_FIELD", "cdid")
     max_size = int(os.getenv("REDIS_MAX_DEVICES", str(max_devices_default)))
     evict_policy = (os.getenv("REDIS_EVICT_POLICY", "play") or "play").strip().lower()
@@ -145,6 +162,8 @@ class RedisDevicePool:
     - {prefix}:data  (HASH) id -> device_json
     - {prefix}:use   (ZSET) id -> use_count
     - {prefix}:fail  (ZSET) id -> fail_count
+    - {prefix}:seq   (STRING/INT) 自增序号（严格 FIFO 用）
+    - {prefix}:in    (ZSET) id -> seq（入队顺序，越小越早入队）
 
     超限淘汰：use_count 最大的先淘汰（最常用的淘汰）
     """
@@ -158,6 +177,9 @@ class RedisDevicePool:
         # 计数：Go stats 会写 play/attempt；Python 写入时也初始化为 0，方便后续淘汰
         self.play_key = f"{cfg.key_prefix}:play"
         self.attempt_key = f"{cfg.key_prefix}:attempt"
+        # FIFO 队列：严格按入队顺序优先取（Go stats 读取时用）
+        self.seq_key = f"{cfg.key_prefix}:seq"
+        self.in_key = f"{cfg.key_prefix}:in"
 
         try:
             import redis  # type: ignore
@@ -202,6 +224,12 @@ class RedisDevicePool:
         - 旧设备：更新 data，不重置计数
         返回：(写入数量, 淘汰数量)
         """
+        # 可观测性：写入前后池子数量变化（用于排查“注册成功但缺口不变”）
+        try:
+            before = int(self.r.scard(self.ids_key))
+        except Exception:
+            before = -1
+
         write_n = 0
         for dev in devices:
             dev_id = self._extract_id(dev)
@@ -213,6 +241,13 @@ class RedisDevicePool:
             pipe.sadd(self.ids_key, dev_id)
             pipe.hset(self.data_key, dev_id, dev_json)
             if not existed:
+                # 严格 FIFO：用自增 seq 作为 score（避免时间戳同秒导致顺序不稳定）
+                try:
+                    seq = int(self.r.incr(self.seq_key))
+                except Exception:
+                    # 回退：毫秒时间戳（非严格但可用）
+                    seq = int(time.time() * 1000)
+                pipe.zadd(self.in_key, {dev_id: seq})
                 pipe.zadd(self.use_key, {dev_id: 0})
                 pipe.zadd(self.fail_key, {dev_id: 0})
                 pipe.zadd(self.play_key, {dev_id: 0})
@@ -221,6 +256,18 @@ class RedisDevicePool:
             write_n += 1
 
         evicted = self.evict_if_needed()
+        try:
+            after = int(self.r.scard(self.ids_key))
+        except Exception:
+            after = -1
+
+        if before >= 0 and after >= 0:
+            delta = after - before
+            # delta==0 常见原因：全部重复 id（SET 去重）或写入后被并发消费/淘汰抵消
+            logger.info(
+                f"[redis] batch_done key={self.cfg.key_prefix} id_field={self.cfg.id_field} "
+                f"batch={len(devices)} wrote={write_n} before={before} after={after} delta={delta} evicted={evicted}"
+            )
         return write_n, evicted
 
     def evict_if_needed(self) -> int:
@@ -250,6 +297,7 @@ class RedisDevicePool:
         for dev_id in ids:
             pipe.srem(self.ids_key, dev_id)
             pipe.hdel(self.data_key, dev_id)
+            pipe.zrem(self.in_key, dev_id)
             pipe.zrem(self.use_key, dev_id)
             pipe.zrem(self.fail_key, dev_id)
             pipe.zrem(self.play_key, dev_id)
@@ -316,7 +364,9 @@ class Config:
     REDIS_MAX_DEVICES = _get_int_from_env("REDIS_MAX_DEVICES", default=TASKS)
     # 单轮补齐最大注册数量（避免一次补太多）
     POLL_BATCH_MAX = _get_int_from_env("MWZZZH_POLL_BATCH_MAX", default=TASKS)
-    # Redis 设备池分库数量（例如 2 => tiktok:device_pool 与 tiktok:device_pool:1）
+    # Redis 设备池分库数量（用于平均分配/多实例并行消费）
+    # - 1：不分库（所有设备写入同一个 tiktok:device_pool）
+    # - N：分库（0号池为 base；i号池为 base:{i}）
     DEVICE_POOL_SHARDS = _get_int_from_env("REDIS_DEVICE_POOL_SHARDS", default=1)
 
     # keep-alive / Session 复用（连接复用 + 达到最大请求数自动淘汰重建）
@@ -727,7 +777,7 @@ async def _poll_fill_loop() -> None:
     if legacy_target is not None and legacy_target.strip():
         logger.warning("[poll] 检测到已废弃配置 REDIS_TARGET_DEVICES，将忽略并以 REDIS_MAX_DEVICES 为准")
 
-    base_prefix = os.getenv("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool").strip() or "tiktok:device_pool"
+    base_prefix = _normalize_pool_base(os.getenv("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool").strip() or "tiktok:device_pool")
     logger.info(f"[poll] 启动：interval={interval}s target={target} batch_max={batch_max} shards={shards} base_prefix={base_prefix}")
 
     while True:
@@ -747,7 +797,7 @@ async def _poll_fill_loop() -> None:
             logger.critical(f"[poll] Redis 连接/读取失败，程序终止: {e}")
             raise SystemExit(1)
 
-        # 选择一个“未满”的池子进行补齐：优先选择当前数量最少的池
+        # 选择一个“未满”的池子进行补齐：优先选择当前数量最少的池（达到平均分配）
         pool_counts.sort(key=lambda x: x[0])
         chosen: tuple[int, int, str] | None = None
         for cur, idx, prefix in pool_counts:
@@ -769,6 +819,14 @@ async def _poll_fill_loop() -> None:
         os.environ["REDIS_DEVICE_POOL_KEY"] = key_prefix
         engine = SpiderEngine()
         await engine.run(tasks_n=fill_n)
+        # 立即回读一次数量，帮助定位“为什么每轮缺口都不变”
+        try:
+            rcfg2 = _get_redis_config(max_devices_default=target)
+            pool2 = RedisDevicePool(rcfg2)
+            cur2 = pool2.count()
+            logger.info(f"[poll] 本轮结束：key_prefix={rcfg2.key_prefix} cur={cur2} target={target} missing={max(0, target - cur2)}")
+        except Exception as e:
+            logger.warning(f"[poll] 本轮结束回读失败: {e}")
         # 本轮跑完立即进入下一轮检查（不额外 sleep）
 
 

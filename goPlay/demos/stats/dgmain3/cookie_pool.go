@@ -105,7 +105,9 @@ func getCookiesForTask(taskID int) (string, map[string]string) {
 	}
 
 	// 统计 cookies 使用次数（用于后台导入的 evict：use_count 最大淘汰）
-	_ = incrStartupCookieUseInRedis(rec.ID, 1)
+	if shouldLoadCookiesFromRedis() {
+		_ = incrStartupCookieUseInRedis(rec.ID, 1)
+	}
 	return rec.ID, rec.Cookies
 }
 

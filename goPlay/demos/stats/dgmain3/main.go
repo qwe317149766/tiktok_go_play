@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"math/rand"
@@ -17,6 +19,132 @@ import (
 	"time"
 	"runtime"
 )
+
+// ---------- rolling gzip compressor (best-effort, non-blocking) ----------
+
+type gzipCompressor struct {
+	enabled bool
+	q       chan string
+	wg      sync.WaitGroup
+}
+
+var globalGzipOnce sync.Once
+var globalGzip *gzipCompressor
+
+func gzipEnabled() bool {
+	// 1=开启滚动后 gzip 压缩（默认开启）
+	return envBool("STATS_ROTATE_GZIP", true)
+}
+
+func gzipWorkers() int {
+	n := envInt("STATS_GZIP_WORKERS", 2)
+	if n <= 0 {
+		return 2
+	}
+	if n > 16 {
+		return 16
+	}
+	return n
+}
+
+func gzipQueueSize() int {
+	n := envInt("STATS_GZIP_QUEUE_SIZE", 200)
+	if n <= 0 {
+		return 200
+	}
+	return n
+}
+
+func getGzipCompressor() *gzipCompressor {
+	globalGzipOnce.Do(func() {
+		enabled := gzipEnabled()
+		gc := &gzipCompressor{
+			enabled: enabled,
+			q:       make(chan string, gzipQueueSize()),
+		}
+		if enabled {
+			for i := 0; i < gzipWorkers(); i++ {
+				gc.wg.Add(1)
+				go func() {
+					defer gc.wg.Done()
+					for path := range gc.q {
+						_ = gzipFileReplace(path)
+					}
+				}()
+			}
+		}
+		globalGzip = gc
+	})
+	return globalGzip
+}
+
+func (gc *gzipCompressor) Enqueue(path string) {
+	if gc == nil || !gc.enabled {
+		return
+	}
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	if strings.HasSuffix(strings.ToLower(path), ".gz") {
+		return
+	}
+	// non-blocking：队列满就跳过（不影响主流程）
+	select {
+	case gc.q <- path:
+	default:
+	}
+}
+
+func (gc *gzipCompressor) Close() {
+	if gc == nil || !gc.enabled {
+		return
+	}
+	close(gc.q)
+	gc.wg.Wait()
+}
+
+func gzipFileReplace(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	// 已不存在则忽略（可能被清理/重复入队）
+	if _, err := os.Stat(path); err != nil {
+		return nil
+	}
+	in, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer in.Close()
+
+	outPath := path + ".gz"
+	tmpPath := outPath + ".tmp"
+	out, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil
+	}
+
+	gw := gzip.NewWriter(out)
+	_, copyErr := io.Copy(gw, in)
+	closeErr := gw.Close()
+	_ = out.Close()
+
+	if copyErr != nil || closeErr != nil {
+		_ = os.Remove(tmpPath)
+		return nil
+	}
+	// 原子替换
+	_ = os.Remove(outPath) // 覆盖旧的 gz（若存在）
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return nil
+	}
+	// 压缩成功后删除原文件
+	_ = os.Remove(path)
+	return nil
+}
 
 // Config 配置
 type Config struct {
@@ -77,6 +205,7 @@ type resultWorker struct {
 	maxBytes     int64
 	queue        <-chan TaskResult
 	done         <-chan struct{}
+	gzipper      *gzipCompressor
 
 	file         *os.File
 	currentBytes int64
@@ -155,6 +284,7 @@ func (w *resultWorker) openForPart(part int) error {
 }
 
 func NewResultWriter(filename string) (*ResultWriter, error) {
+	gz := getGzipCompressor()
 	rw := &ResultWriter{
 		baseFilename: filename,
 		maxBytes:     getStatsResultMaxBytes(),
@@ -172,6 +302,7 @@ func NewResultWriter(filename string) (*ResultWriter, error) {
 			maxBytes:     rw.maxBytes,
 			queue:        ch,
 			done:         rw.done,
+			gzipper:      gz,
 			batch:        make([]TaskResult, 0, 200),
 		}
 		// 每个 worker 从 part0001 开始写自己的文件
@@ -218,8 +349,14 @@ func (w *resultWorker) run() {
 			line := string(data) + "\n"
 			// 到达阈值时滚动到下一个文件（默认 20MB）
 			if w.maxBytes > 0 && w.currentBytes+int64(len(line)) > w.maxBytes {
+				// 关闭并异步压缩旧文件（best-effort，不阻塞）
+				oldPart := w.part
+				oldName := makePartFilename(w.baseFilename, w.id, oldPart)
 				if w.file != nil {
 					_ = w.file.Close()
+				}
+				if w.gzipper != nil {
+					w.gzipper.Enqueue(oldName)
 				}
 				_ = w.openForPart(w.part + 1)
 			}
@@ -279,6 +416,7 @@ type ErrorWriter struct {
 }
 
 func NewErrorWriter(filename string) (*ErrorWriter, error) {
+	gz := getGzipCompressor()
 	ew := &ErrorWriter{
 		baseFilename: filename,
 		maxBytes:     getStatsErrorMaxBytes(),
@@ -296,6 +434,7 @@ func NewErrorWriter(filename string) (*ErrorWriter, error) {
 			maxBytes:     ew.maxBytes,
 			queue:        ch,
 			done:         ew.done,
+			gzipper:      gz,
 			batch:        make([]string, 0, 100),
 		}
 		if err := w.openForPart(1); err != nil {
@@ -386,6 +525,7 @@ type errorWorker struct {
 	maxBytes     int64
 	queue        <-chan string
 	done         <-chan struct{}
+	gzipper      *gzipCompressor
 
 	file         *os.File
 	currentBytes int64
@@ -436,8 +576,14 @@ func (w *errorWorker) run() {
 		for _, msg := range w.batch {
 			line := msg + "\n"
 			if w.maxBytes > 0 && w.currentBytes+int64(len(line)) > w.maxBytes {
+				// 关闭并异步压缩旧文件（best-effort，不阻塞）
+				oldPart := w.part
+				oldName := makeErrorPartFilename(w.baseFilename, w.id, oldPart)
 				if w.file != nil {
 					_ = w.file.Close()
+				}
+				if w.gzipper != nil {
+					w.gzipper.Enqueue(oldName)
 				}
 				_ = w.openForPart(w.part + 1)
 			}
@@ -482,6 +628,50 @@ type ErrorStats struct {
 	NetworkErrors int64 // 网络连接错误
 	ParseErrors   int64 // 解析错误
 	OtherErrors   int64 // 其他错误
+	// stats 阶段的细分错误（你提到的“其他错误也要统计”）
+	TimeoutErrors   int64 // 超时（含 context deadline / Client.Timeout / i/o timeout）
+	HTTP403Errors   int64 // 403
+	HTTP429Errors   int64 // 429
+	HTTP5xxErrors   int64 // 5xx
+	CaptchaErrors   int64 // captcha/verify
+	EmptyRespErrors int64 // err=nil 但响应为空
+}
+
+func looksTimeout(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return false
+	}
+	return strings.Contains(s, "timeout") ||
+		strings.Contains(s, "deadline exceeded") ||
+		strings.Contains(s, "context deadline exceeded") ||
+		strings.Contains(s, "client.timeout") ||
+		strings.Contains(s, "i/o timeout")
+}
+
+func looksHTTP403(s string) bool {
+	s = strings.ToLower(s)
+	return strings.Contains(s, " 403") || strings.Contains(s, "status 403") || strings.Contains(s, "statuscode=403") || strings.Contains(s, "status code 403")
+}
+
+func looksHTTP429(s string) bool {
+	s = strings.ToLower(s)
+	return strings.Contains(s, " 429") || strings.Contains(s, "status 429") || strings.Contains(s, "statuscode=429") || strings.Contains(s, "status code 429") || strings.Contains(s, "too many requests")
+}
+
+func looksHTTP5xx(s string) bool {
+	s = strings.ToLower(s)
+	for _, code := range []string{"500", "502", "503", "504"} {
+		if strings.Contains(s, " "+code) || strings.Contains(s, "status "+code) || strings.Contains(s, "statuscode="+code) || strings.Contains(s, "status code "+code) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksCaptcha(s string) bool {
+	s = strings.ToLower(s)
+	return strings.Contains(s, "captcha") || strings.Contains(s, "verify") || strings.Contains(s, "verification")
 }
 
 // Engine 高性能引擎
@@ -1106,6 +1296,13 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 	}
 
 	success := res != ""
+	if !success {
+		// 细分统计：err=nil 但响应为空，也算 stats 失败的一种
+		// 统一给一个 reason，方便后续汇总
+		if res == "" {
+			// 只在没有其它 reason 的情况下补充
+		}
+	}
 	// cookie 成功/失败统计：success=false 视为一次“非网络失败”（主要用于风控/被拒）
 	// 注意：Stats3 err!=nil 的情况已在上面 return，这里只有 err==nil。
 	if cm := GetCookieManager(); cm != nil && ckID != "" {
@@ -1143,6 +1340,10 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 		"raw":       "",
 		"pool_id":   poolID,
 		"device_id": deviceID,
+	}
+	if !success {
+		result["reason"] = "empty response"
+		result["network_error"] = false
 	}
 	if len(res) > 2000 {
 		result["raw"] = res[:2000]
@@ -1239,8 +1440,27 @@ func (e *Engine) taskWrapper(taskID int) {
 			atomic.AddInt64(&e.errorStats.TokenErrors, 1)
 		case "stats":
 			atomic.AddInt64(&e.errorStats.StatsErrors, 1)
-			if isNetworkError {
+			// stats 阶段：补充细分统计（把“其他错误”拆出来）
+			if isNetworkError || looksTimeout(reason) {
 				atomic.AddInt64(&e.errorStats.NetworkErrors, 1)
+			}
+			if looksTimeout(reason) {
+				atomic.AddInt64(&e.errorStats.TimeoutErrors, 1)
+			}
+			if looksHTTP403(reason) {
+				atomic.AddInt64(&e.errorStats.HTTP403Errors, 1)
+			}
+			if looksHTTP429(reason) {
+				atomic.AddInt64(&e.errorStats.HTTP429Errors, 1)
+			}
+			if looksHTTP5xx(reason) {
+				atomic.AddInt64(&e.errorStats.HTTP5xxErrors, 1)
+			}
+			if looksCaptcha(reason) {
+				atomic.AddInt64(&e.errorStats.CaptchaErrors, 1)
+			}
+			if strings.Contains(strings.ToLower(reason), "empty response") {
+				atomic.AddInt64(&e.errorStats.EmptyRespErrors, 1)
 			}
 		case "parse":
 			atomic.AddInt64(&e.errorStats.ParseErrors, 1)
@@ -1266,10 +1486,14 @@ func (e *Engine) taskWrapper(taskID int) {
 }
 
 func (e *Engine) Run() {
-	defer e.writer.Close()
-	if e.errorWriter != nil {
-		defer e.errorWriter.Close()
-	}
+	defer func() {
+		e.writer.Close()
+		if e.errorWriter != nil {
+			e.errorWriter.Close()
+		}
+		// 关闭压缩后台（等待压缩队列尽量处理完；仅影响退出阶段）
+		getGzipCompressor().Close()
+	}()
 
 	startTime := time.Now()
 	// 不打印开始日志，只打印进度日志
@@ -1302,6 +1526,12 @@ func (e *Engine) Run() {
 				networkErr := atomic.LoadInt64(&e.errorStats.NetworkErrors)
 				parseErr := atomic.LoadInt64(&e.errorStats.ParseErrors)
 				otherErr := atomic.LoadInt64(&e.errorStats.OtherErrors)
+				tmoErr := atomic.LoadInt64(&e.errorStats.TimeoutErrors)
+				h403 := atomic.LoadInt64(&e.errorStats.HTTP403Errors)
+				h429 := atomic.LoadInt64(&e.errorStats.HTTP429Errors)
+				h5xx := atomic.LoadInt64(&e.errorStats.HTTP5xxErrors)
+				capErr := atomic.LoadInt64(&e.errorStats.CaptchaErrors)
+				emptyErr := atomic.LoadInt64(&e.errorStats.EmptyRespErrors)
 				// 设备淘汰统计（方式A）
 				evAll := atomic.LoadInt64(&e.evictedTotal)
 				evFail := atomic.LoadInt64(&e.evictedFail)
@@ -1323,9 +1553,11 @@ func (e *Engine) Run() {
 				}
 				curConc := atomic.LoadInt64(&e.currentConcurrency)
 
-				log.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%% | 错误分类: seed=%d, token=%d, stats=%d, network=%d, parse=%d, other=%d | 设备淘汰: total=%d (fail=%d, play=%d) banned=%d | Cookies更换: total=%d banned=%d | 并发(动态)=%d/%d | 写入丢弃: results=%d error=%d",
-					success, failed, total, rate, seedErr, tokenErr, statsErr, networkErr, parseErr, otherErr,
+				log.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%% | 错误分类: seed=%d, token=%d, stats=%d, network=%d, parse=%d, other=%d, timeout=%d, http403=%d, http429=%d, http5xx=%d, captcha=%d, empty=%d | 设备淘汰: total=%d (fail=%d, play=%d) banned=%d | Cookies更换: total=%d banned=%d | 并发(动态)=%d/%d | 写入丢弃: results=%d error=%d",
+					success, failed, total, rate, seedErr, tokenErr, statsErr, networkErr, parseErr, otherErr, tmoErr, h403, h429, h5xx, capErr, emptyErr,
 					evAll, evFail, evPlay, bannedN, ckRepl, ckBanned, curConc, int64(e.maxConcurrency), dropRes, dropErr)
+				// 兜底：确保进度一定打印到 stdout（避免 log 输出被重定向/吞掉）
+				fmt.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%%\n", success, failed, total, rate)
 				// 动态调整并发数
 				e.adjustConcurrency()
 
@@ -1390,6 +1622,12 @@ func (e *Engine) Run() {
 	networkErr := atomic.LoadInt64(&e.errorStats.NetworkErrors)
 	parseErr := atomic.LoadInt64(&e.errorStats.ParseErrors)
 	otherErr := atomic.LoadInt64(&e.errorStats.OtherErrors)
+	tmoErr := atomic.LoadInt64(&e.errorStats.TimeoutErrors)
+	h403 := atomic.LoadInt64(&e.errorStats.HTTP403Errors)
+	h429 := atomic.LoadInt64(&e.errorStats.HTTP429Errors)
+	h5xx := atomic.LoadInt64(&e.errorStats.HTTP5xxErrors)
+	capErr := atomic.LoadInt64(&e.errorStats.CaptchaErrors)
+	emptyErr := atomic.LoadInt64(&e.errorStats.EmptyRespErrors)
 
 	successRate := 0.0
 	if total > 0 {
@@ -1402,8 +1640,8 @@ func (e *Engine) Run() {
 	fmt.Printf("失败: %d\n", failed)
 	fmt.Printf("总数: %d\n", total)
 	fmt.Printf("成功率: %.2f%%\n", successRate)
-	fmt.Printf("错误分类统计：seed=%d, token=%d, stats=%d, network=%d, parse=%d, other=%d\n",
-		seedErr, tokenErr, statsErr, networkErr, parseErr, otherErr)
+	fmt.Printf("错误分类统计：seed=%d, token=%d, stats=%d, network=%d, parse=%d, other=%d, timeout=%d, http403=%d, http429=%d, http5xx=%d, captcha=%d, empty=%d\n",
+		seedErr, tokenErr, statsErr, networkErr, parseErr, otherErr, tmoErr, h403, h429, h5xx, capErr, emptyErr)
 	fmt.Printf("=============================\n")
 }
 
@@ -1430,6 +1668,11 @@ func main() {
 	loadEnvForDemo()
 	applyRedisPoolShardFromArgs(os.Args)
 
+	// 确保进度日志在控制台可见（有些环境 stderr 不明显/被上层吞掉）
+	// 默认 log 输出到 stderr；这里强制到 stdout，避免“执行进度没有输出”的观感问题
+	log.SetOutput(os.Stdout)
+	log.SetFlags(log.LstdFlags)
+
 	// 并发数：从 env 读取（统一配置）
 	// 优先级：STATS_CONCURRENCY > GEN_CONCURRENCY > 代码默认值
 	if v := envInt("STATS_CONCURRENCY", 0); v > 0 {
@@ -1442,7 +1685,22 @@ func main() {
 	if proxiesPath == "" {
 		proxiesPath = "proxies.txt"
 	}
-	devicesPath := "devices.txt"
+	// 设备文件路径（文件模式）
+	// 优先级：
+	// - DEVICES_FILE（统一配置，推荐）
+	// - STATS_DEVICES_FILE（stats 专用，兼容）
+	// - 向上查找仓库根目录的 devices.txt
+	// - 当前目录 devices.txt
+	devicesPath := strings.TrimSpace(os.Getenv("DEVICES_FILE"))
+	if devicesPath == "" {
+		devicesPath = strings.TrimSpace(os.Getenv("STATS_DEVICES_FILE"))
+	}
+	if devicesPath == "" {
+		devicesPath = findTopmostFileUpwards("devices.txt", 8)
+	}
+	if devicesPath == "" {
+		devicesPath = "devices.txt"
+	}
 
 	// 加载代理
 	if data, err := ioutil.ReadFile(proxiesPath); err == nil {
@@ -1461,6 +1719,15 @@ func main() {
 
 	// 加载设备：优先从 Python 注册成功写入的 Redis 设备池读取
 	if shouldLoadDevicesFromRedis() {
+		// 可观测性：明确告诉你当前是否在读“startup 注册成功设备池”
+		if shouldLoadDevicesFromStartupRedis() {
+			fmt.Printf("设备来源=startup_redis prefix=%s（来自 REDIS_STARTUP_DEVICE_POOL_KEY；未配置则回退 REDIS_DEVICE_POOL_KEY）\n",
+				strings.TrimSpace(startupDevicePoolPrefix()))
+		}
+		if shouldLoadDevicesFromStartupCookieRedis() {
+			fmt.Printf("设备来源=startup_cookie_redis prefix=%s（来自 REDIS_STARTUP_COOKIE_POOL_KEY；账号池=data 存完整账号JSON）\n",
+				strings.TrimSpace(envStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")))
+		}
 		// Redis 模式：用多少取多少
 		// 默认按并发数取设备（例如并发 1000 就先取 1000 个），设备淘汰时再从 Redis 补位。
 		need := envInt("DEVICES_LIMIT", 0)
@@ -1470,7 +1737,26 @@ func main() {
 		if need <= 0 {
 			need = 1
 		}
-		devs, err := loadDevicesFromRedisN(need)
+		var devs []string
+		var err error
+		if shouldLoadDevicesFromStartupCookieRedis() {
+			// 账号池为空时：按你的要求轮询等待，不要直接退出
+			pollSec := envInt("STATS_ACCOUNT_POLL_INTERVAL_SEC", envInt("STATS_COOKIE_POLL_INTERVAL_SEC", envInt("COOKIES_POLL_INTERVAL_SEC", 10)))
+			if pollSec <= 0 {
+				pollSec = 10
+			}
+			for {
+				devs, err = loadStartupAccountDevicesFromRedisN(need)
+				if err == nil && len(devs) > 0 {
+					break
+				}
+				fmt.Printf("账号池为空/无有效账号（REDIS_STARTUP_COOKIE_POOL_KEY=%s），将每 %d 秒轮询等待补齐...\n",
+					strings.TrimSpace(envStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")), pollSec)
+				time.Sleep(time.Duration(pollSec) * time.Second)
+			}
+		} else {
+			devs, err = loadDevicesFromRedisN(need)
+		}
 		if err != nil {
 			fmt.Printf("从Redis读取设备失败: %v\n", err)
 			os.Exit(1)
@@ -1527,16 +1813,57 @@ func main() {
 	}
 
 	// 加载 cookies：必须来自 Go startUp 注册写入的 Redis cookie 池
-	if shouldLoadCookiesFromRedis() {
+	// 你要求：stats 的 cookies 和 设备必须来自同一个 JSON（账号池里每条完整账号 JSON 含 cookies 字段）。
+	// 当设备来源是 startup_cookie_redis 时，强制从 config.Devices（即账号 JSON 列表）抽取 cookies，保证同源。
+	if shouldLoadDevicesFromStartupCookieRedis() {
 		limit := envInt("COOKIES_LIMIT", 0)
-		cookies, err := loadStartupCookiesFromRedis(limit)
-		if err != nil {
-			fmt.Printf("从Redis读取startUp cookies失败: %v\n", err)
+		cookies := loadCookiesFromStartupDevices(config.Devices, limit)
+		if len(cookies) == 0 {
+			fmt.Printf("从账号池设备列表提取 cookies 失败：请确认 startup_cookie_pool:data 存的是完整账号 JSON 且包含 cookies 字段\n")
 			os.Exit(1)
 		}
-		// 存到全局变量（供 Stats3 按 task 轮询使用）
 		globalCookiePool = cookies
-		fmt.Printf("已从Redis加载 %d 份 startUp cookies\n", len(globalCookiePool))
+		fmt.Printf("已从账号池设备列表抽取 %d 份 cookies（与设备同源）\n", len(globalCookiePool))
+	} else if shouldLoadCookiesFromDevicesFile() {
+		limit := envInt("COOKIES_LIMIT", 0)
+		// 从“设备列表”抽取 cookies：config.Devices 每行 JSON（包含 cookies 字段）
+		// - 如果 DEVICES_SOURCE=file，则来自设备文件（如 startUp 导出的 devices12_21_3.txt）
+		// - 如果 DEVICES_SOURCE=redis，则来自 Redis 设备池（需确保每条设备 JSON 也包含 cookies 字段）
+		cookies := loadCookiesFromStartupDevices(config.Devices, limit)
+		if len(cookies) == 0 {
+			fmt.Printf("从设备文件提取 cookies 失败：请确认设备文件每行包含 cookies 字段（如 {'k':'v'}），并检查 create_time 过滤是否过严\n")
+			os.Exit(1)
+		}
+		globalCookiePool = cookies
+		fmt.Printf("已从设备列表抽取 %d 份 cookies（来自每行 cookies 字段）\n", len(globalCookiePool))
+	} else if shouldLoadCookiesFromRedis() {
+		// 强提示：如果你想“设备也来自 signup 注册成功账号池”，请打开 DEVICES_SOURCE=startup_redis，
+		// 并让 COOKIES_SOURCE=devices_file 从设备 JSON 的 cookies 字段抽取（做到设备+cookies 同源）。
+		if !shouldLoadDevicesFromStartupRedis() && !shouldLoadDevicesFromStartupCookieRedis() {
+			fmt.Printf("⚠️  当前 COOKIES_SOURCE=redis 但 DEVICES_SOURCE 不是 startup_redis/startup_cookie_redis：设备可能不来自 signup 注册成功账号池。建议：DEVICES_SOURCE=startup_cookie_redis + COOKIES_SOURCE=devices_file\n")
+		}
+		limit := envInt("COOKIES_LIMIT", 0)
+		// 你要求：当 cookies 池为空时不要直接开跑，而是轮询等待（由 signup/dgemail cookie poll 补齐）
+		pollSec := envInt("STATS_COOKIE_POLL_INTERVAL_SEC", envInt("COOKIES_POLL_INTERVAL_SEC", 10))
+		if pollSec <= 0 {
+			pollSec = 10
+		}
+		for {
+			cookies, err := loadStartupCookiesFromRedis(limit)
+			if err != nil {
+				fmt.Printf("从Redis读取startUp cookies失败: %v\n", err)
+				os.Exit(1)
+			}
+			if len(cookies) > 0 {
+				// 存到全局变量（供 Stats3 按 task 轮询使用）
+				globalCookiePool = cookies
+				fmt.Printf("已从Redis加载 %d 份 startUp cookies\n", len(globalCookiePool))
+				break
+			}
+			fmt.Printf("startUp cookies 池为空（REDIS_STARTUP_COOKIE_POOL_KEY=%s），将每 %d 秒轮询等待补齐...\n",
+				strings.TrimSpace(envStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")), pollSec)
+			time.Sleep(time.Duration(pollSec) * time.Second)
+		}
 	} else {
 		fmt.Printf("未启用 COOKIES_SOURCE=redis（COOKIES_FROM_REDIS 为旧兼容写法），将继续使用 stats.go 的空 cookies（通常会失败）\n")
 	}
@@ -1575,7 +1902,11 @@ func applyRedisPoolShardFromArgs(args []string) {
 			deviceIdx = n
 		}
 	}
-	if len(args) >= 3 {
+	// 只传一个 idx：默认按“cookie 分库”理解（device 默认不分库）
+	if len(args) < 3 {
+		cookieIdx = deviceIdx
+		deviceIdx = 0
+	} else if len(args) >= 3 {
 		if n, err := strconv.Atoi(strings.TrimSpace(args[2])); err == nil && n >= 0 {
 			cookieIdx = n
 		}
@@ -1588,6 +1919,10 @@ func applyRedisPoolShardFromArgs(args []string) {
 	}
 	if ckShards <= 0 {
 		ckShards = 1
+	}
+	// device 池默认不分库：如果没有配置 device shards（或=1），则忽略 deviceIdx
+	if devShards <= 1 {
+		deviceIdx = 0
 	}
 	if deviceIdx >= devShards {
 		log.Printf("[pool] devicePoolIdx=%d 超出 REDIS_DEVICE_POOL_SHARDS=%d，自动回退为 0", deviceIdx, devShards)

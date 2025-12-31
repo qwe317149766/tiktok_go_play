@@ -78,7 +78,11 @@ def _get_redis_config(max_devices_default: int) -> RedisConfig:
     username = os.getenv("REDIS_USERNAME") or None
     password = os.getenv("REDIS_PASSWORD") or None
     ssl = _parse_bool(os.getenv("REDIS_SSL"), False)
-    key_prefix = os.getenv("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool")
+    # 设备池按“固定不分库”使用：避免误配置成 tiktok:device_pool:<idx>
+    key_prefix = (os.getenv("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool") or "tiktok:device_pool").strip()
+    parts = key_prefix.split(":")
+    if len(parts) >= 2 and parts[-1].isdigit():
+        key_prefix = ":".join(parts[:-1]).strip() or key_prefix
     id_field = os.getenv("REDIS_DEVICE_ID_FIELD", "cdid")
     max_size = int(os.getenv("REDIS_MAX_DEVICES", str(max_devices_default)))
     return RedisConfig(

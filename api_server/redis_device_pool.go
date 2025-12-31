@@ -160,13 +160,19 @@ func (s *Server) devicePoolKeys(prefix string) (idsKey, dataKey, useKey, failKey
 	return prefix + ":ids", prefix + ":data", prefix + ":use", prefix + ":fail", prefix + ":play", prefix + ":attempt"
 }
 
+func (s *Server) devicePoolOrderKeys(prefix string) (seqKey, inKey string) {
+	// 与 Python mwzzzh_spider.py 保持一致：:seq 自增 + :in FIFO 队列
+	return prefix + ":seq", prefix + ":in"
+}
+
 func (s *Server) clearDevicePool(ctx context.Context, prefix string) error {
 	cache, err := s.redisClient()
 	if err != nil {
 		return err
 	}
 	idsKey, dataKey, useKey, failKey, playKey, attemptKey := s.devicePoolKeys(prefix)
-	return cache.rdb.Del(ctx, idsKey, dataKey, useKey, failKey, playKey, attemptKey).Err()
+	seqKey, inKey := s.devicePoolOrderKeys(prefix)
+	return cache.rdb.Del(ctx, idsKey, dataKey, useKey, failKey, playKey, attemptKey, seqKey, inKey).Err()
 }
 
 func (s *Server) evictOne(ctx context.Context, prefix string, policy string) (string, bool, error) {
@@ -175,6 +181,7 @@ func (s *Server) evictOne(ctx context.Context, prefix string, policy string) (st
 		return "", false, err
 	}
 	idsKey, dataKey, useKey, failKey, playKey, attemptKey := s.devicePoolKeys(prefix)
+	_, inKey := s.devicePoolOrderKeys(prefix)
 
 	chooseZ := func(p string) string {
 		switch p {
@@ -219,6 +226,7 @@ func (s *Server) evictOne(ctx context.Context, prefix string, policy string) (st
 
 	pipe := cache.rdb.Pipeline()
 	pipe.HDel(ctx, dataKey, victim)
+	pipe.ZRem(ctx, inKey, victim)
 	pipe.ZRem(ctx, useKey, victim)
 	pipe.ZRem(ctx, failKey, victim)
 	pipe.ZRem(ctx, playKey, victim)
@@ -256,6 +264,7 @@ func (s *Server) importDevicesToRedis(ctx context.Context, mode DeviceImportMode
 	}
 
 	idsKey, dataKey, useKey, failKey, playKey, attemptKey := s.devicePoolKeys(prefix)
+	seqKey, inKey := s.devicePoolOrderKeys(prefix)
 
 	addOne := func(deviceJSON string, m map[string]any) error {
 		id, ok := extractDeviceID(m, idField)
@@ -267,6 +276,12 @@ func (s *Server) importDevicesToRedis(ctx context.Context, mode DeviceImportMode
 		play := getInt64FromAny(m, "play_count")
 		attempt := getInt64FromAny(m, "attempt_count")
 
+		// 是否新设备：用于 FIFO 入队（只对首次入队写入 :in）
+		existed, isMemErr := cache.rdb.SIsMember(ctx, idsKey, id).Result()
+		if isMemErr != nil {
+			return isMemErr
+		}
+
 		pipe := cache.rdb.Pipeline()
 		pipe.SAdd(ctx, idsKey, id)
 		pipe.HSet(ctx, dataKey, id, deviceJSON)
@@ -274,8 +289,13 @@ func (s *Server) importDevicesToRedis(ctx context.Context, mode DeviceImportMode
 		pipe.ZAdd(ctx, failKey, redis.Z{Member: id, Score: float64(fail)})
 		pipe.ZAdd(ctx, playKey, redis.Z{Member: id, Score: float64(play)})
 		pipe.ZAdd(ctx, attemptKey, redis.Z{Member: id, Score: float64(attempt)})
-		_, err := pipe.Exec(ctx)
-		return err
+		if !existed {
+			seq := cache.rdb.Incr(ctx, seqKey)
+			// 用 Lua/事务也可以更原子，但这里足够：seq 自增保证顺序严格递增
+			pipe.ZAddNX(ctx, inKey, redis.Z{Member: id, Score: float64(seq.Val())})
+		}
+		_, execErr := pipe.Exec(ctx)
+		return execErr
 	}
 
 	// 容量控制：
@@ -390,6 +410,7 @@ func (s *Server) importDevicesToRedisSharded(ctx context.Context, mode DeviceImp
 
 	addToPrefix := func(prefix string, deviceJSON string, m map[string]any) error {
 		idsKey, dataKey, useKey, failKey, playKey, attemptKey := s.devicePoolKeys(prefix)
+		seqKey, inKey := s.devicePoolOrderKeys(prefix)
 		id, ok := extractDeviceID(m, idField)
 		if !ok {
 			return fmt.Errorf("missing device id field: %s", idField)
@@ -398,6 +419,10 @@ func (s *Server) importDevicesToRedisSharded(ctx context.Context, mode DeviceImp
 		fail := getInt64FromAny(m, "fail_count")
 		play := getInt64FromAny(m, "play_count")
 		attempt := getInt64FromAny(m, "attempt_count")
+		existed, isMemErr := cache.rdb.SIsMember(ctx, idsKey, id).Result()
+		if isMemErr != nil {
+			return isMemErr
+		}
 		pipe := cache.rdb.Pipeline()
 		pipe.SAdd(ctx, idsKey, id)
 		pipe.HSet(ctx, dataKey, id, deviceJSON)
@@ -405,8 +430,12 @@ func (s *Server) importDevicesToRedisSharded(ctx context.Context, mode DeviceImp
 		pipe.ZAdd(ctx, failKey, redis.Z{Member: id, Score: float64(fail)})
 		pipe.ZAdd(ctx, playKey, redis.Z{Member: id, Score: float64(play)})
 		pipe.ZAdd(ctx, attemptKey, redis.Z{Member: id, Score: float64(attempt)})
-		_, err := pipe.Exec(ctx)
-		return err
+		if !existed {
+			seq := cache.rdb.Incr(ctx, seqKey)
+			pipe.ZAddNX(ctx, inKey, redis.Z{Member: id, Score: float64(seq.Val())})
+		}
+		_, execErr := pipe.Exec(ctx)
+		return execErr
 	}
 
 	choosePool := func() *pc {

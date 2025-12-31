@@ -7,9 +7,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
-	"time"
-
-	"github.com/redis/go-redis/v9"
 )
 
 func cookieIDFromMap(cookies map[string]string) string {
@@ -24,11 +21,33 @@ func cookieIDFromMap(cookies map[string]string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// saveStartupCookiesToRedis 将 startUp 注册得到的 cookies 写入 Redis cookie 池
+func deviceIDFromAny(m map[string]interface{}) string {
+	if m == nil {
+		return ""
+	}
+	if v, ok := m["device_id"]; ok {
+		switch t := v.(type) {
+		case string:
+			return strings.TrimSpace(t)
+		case float64:
+			return fmt.Sprintf("%.0f", t)
+		case int:
+			return fmt.Sprintf("%d", t)
+		case int64:
+			return fmt.Sprintf("%d", t)
+		default:
+			return strings.TrimSpace(fmt.Sprintf("%v", t))
+		}
+	}
+	return ""
+}
+
+// saveStartupCookiesToRedis 将 startUp 注册成功的“账号数据”写入 Redis 账号池（沿用 startup_cookie_pool 的 key 结构）
+// 账号数据格式：完整设备字段 + cookies 字段（cookies 是该 JSON 的一个字段）
 // key 结构：
 // - {prefix}:ids  (SET)
-// - {prefix}:data (HASH) id -> json(cookies map)
-func saveStartupCookiesToRedis(all []RegisterResult, targetOverride int) (int, error) {
+// - {prefix}:data (HASH) id -> json(account)  (account 里包含 cookies 字段)
+func saveStartupCookiesToRedis(accounts []map[string]interface{}, targetOverride int) (int, error) {
 	if !getEnvBool("SAVE_STARTUP_COOKIES_TO_REDIS", false) {
 		return 0, nil
 	}
@@ -42,7 +61,8 @@ func saveStartupCookiesToRedis(all []RegisterResult, targetOverride int) (int, e
 		target = getEnvInt("MAX_GENERATE", 0)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	// 对齐 stats/dgemail poll：统一使用可配置的 bulk load timeout，避免大批量写入时超时
+	ctx, cancel := context.WithTimeout(context.Background(), redisLoadTimeout())
 	defer cancel()
 
 	rdb, err := newRedisClient()
@@ -50,36 +70,16 @@ func saveStartupCookiesToRedis(all []RegisterResult, targetOverride int) (int, e
 		return 0, fmt.Errorf("redis init: %w", err)
 	}
 	defer rdb.Close()
-	if err := rdb.Ping(ctx).Err(); err != nil {
-		return 0, fmt.Errorf("redis ping: %w", err)
-	}
-
-	prefix := getEnvStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")
-	idsKey := prefix + ":ids"
-	dataKey := prefix + ":data"
-	useKey := prefix + ":use"
 
 	wrote := 0
-	for _, r := range all {
-		if !r.Success || len(r.Cookies) == 0 {
-			continue
-		}
-		id := cookieIDFromMap(r.Cookies)
-		val, _ := json.Marshal(r.Cookies)
-
-		pipe := rdb.TxPipeline()
-		pipe.SAdd(ctx, idsKey, id)
-		pipe.HSet(ctx, dataKey, id, string(val))
-		// 初始化 cookies 使用次数（不覆盖已有统计）
-		pipe.ZAddNX(ctx, useKey, redis.Z{Member: id, Score: 0})
-		if _, err := pipe.Exec(ctx); err != nil {
-			return wrote, fmt.Errorf("redis write cookie: %w", err)
-		}
-
-		wrote++
-		if target > 0 && wrote >= target {
-			break
-		}
+	// 为了复用“按 shard 分组 pipeline”的实现，这里按 target 做切片上限，然后统一写入
+	if target > 0 && len(accounts) > target {
+		accounts = accounts[:target]
+	}
+	n, err := writeStartupAccountsToRedisWithClient(ctx, rdb, accounts)
+	wrote += n
+	if err != nil {
+		return wrote, err
 	}
 	return wrote, nil
 }

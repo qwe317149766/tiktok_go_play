@@ -14,6 +14,10 @@ func getSignupDeviceMinAgeHours() int {
 	if v := getEnvInt("DEVICE_MIN_AGE_HOURS", 0); v > 0 {
 		return v
 	}
+	// 兼容：很多环境只配置了 stats 的筛选参数，希望 signup 也复用同一个 N 小时
+	if v := getEnvInt("STATS_DEVICE_MIN_AGE_HOURS", 0); v > 0 {
+		return v
+	}
 	return 0
 }
 
