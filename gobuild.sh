@@ -5,7 +5,7 @@ set -e
 # 可配置项
 ############################
 
-GO_VERSION="1.22.1"
+GO_VERSION="1.25.0"
 INSTALL_DIR="/usr/local"
 PROFILE_FILE="/etc/profile.d/go.sh"
 GOPATH_DIR="/opt/go"
