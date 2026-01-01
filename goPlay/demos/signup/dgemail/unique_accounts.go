@@ -28,9 +28,10 @@ func dgemailEmailPrefix() string {
 }
 
 func dgemailEmailSeqKey() string {
-	k := strings.TrimSpace(getEnvStr("DGEMAIL_EMAIL_SEQ_KEY", "tiktok:dgemail:email_seq"))
+	// DB counters.name
+	k := strings.TrimSpace(getEnvStr("DGEMAIL_EMAIL_SEQ_KEY", "dgemail_email_seq"))
 	if k == "" {
-		return "tiktok:dgemail:email_seq"
+		return "dgemail_email_seq"
 	}
 	return k
 }
@@ -59,18 +60,25 @@ func reserveEmailSeq(count int) (start, end int64, ok bool) {
 	if count <= 0 {
 		return 0, 0, false
 	}
-	rdb, err := newRedisClient()
+	db, err := getSignupDB()
 	if err != nil {
 		return 0, 0, false
 	}
-	defer rdb.Close()
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	// INCRBY 返回 end
-	end64, err := rdb.IncrBy(ctx, dgemailEmailSeqKey(), int64(count)).Result()
+	// 原子申请区间：
+	// INSERT ON DUPLICATE + LAST_INSERT_ID(val+count)
+	// 再 SELECT LAST_INSERT_ID() 得到 end
+	_, err = db.ExecContext(ctx,
+		"INSERT INTO counters(name,val) VALUES(?,0) ON DUPLICATE KEY UPDATE val=LAST_INSERT_ID(val+?)",
+		dgemailEmailSeqKey(), int64(count),
+	)
 	if err != nil {
+		return 0, 0, false
+	}
+	var end64 int64
+	if err := db.QueryRowContext(ctx, "SELECT LAST_INSERT_ID()").Scan(&end64); err != nil {
 		return 0, 0, false
 	}
 	start64 := end64 - int64(count) + 1
@@ -102,7 +110,7 @@ func generateUniqueAccounts(count int) []AccountInfo {
 			}
 			return out
 		}
-		log.Printf("[acct] ⚠️ 无法从 Redis 申请唯一邮箱序号，将回退为随机生成（可能跨进程重复）；可检查 Redis 配置/连接或设置 DGEMAIL_UNIQUE_ACCOUNTS=0")
+		log.Printf("[acct] ⚠️ 无法从 DB counters 申请唯一邮箱序号，将回退为随机生成（可能跨进程重复）；可检查 DB 配置/连接或设置 DGEMAIL_UNIQUE_ACCOUNTS=0")
 	}
 
 	// fallback：保证“本批次”不重复（跨进程不保证）

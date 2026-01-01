@@ -91,7 +91,7 @@ func (s *Server) handleAdminImportDevices(w http.ResponseWriter, r *http.Request
 
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	res, err := s.importDevicesToRedisSharded(ctx, mode, lines)
+	res, err := s.importDevicesToDBSharded(ctx, mode, lines)
 	if err != nil {
 		writeJSONAny(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -99,44 +99,7 @@ func (s *Server) handleAdminImportDevices(w http.ResponseWriter, r *http.Request
 	writeJSONAny(w, http.StatusOK, res)
 }
 
-// ---- cookies -> redis (startUp cookie pool) ----
-
-func parseCookieLine(line string) (map[string]string, bool) {
-	line = strings.TrimSpace(line)
-	if line == "" {
-		return nil, false
-	}
-	if strings.HasPrefix(line, "{") {
-		var m map[string]string
-		if err := json.Unmarshal([]byte(line), &m); err != nil || len(m) == 0 {
-			return nil, false
-		}
-		return m, true
-	}
-	// "k=v; k2=v2"
-	out := map[string]string{}
-	parts := strings.Split(line, ";")
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		kv := strings.SplitN(p, "=", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		k := strings.TrimSpace(kv[0])
-		v := strings.TrimSpace(kv[1])
-		if k == "" {
-			continue
-		}
-		out[k] = v
-	}
-	if len(out) == 0 {
-		return nil, false
-	}
-	return out, true
-}
+// ---- cookies/accounts -> mysql (startup_cookie_accounts) ----
 
 func (s *Server) handleAdminImportCookies(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -168,7 +131,7 @@ func (s *Server) handleAdminImportCookies(w http.ResponseWriter, r *http.Request
 	lines := splitLines(raw)
 	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 	defer cancel()
-	res, err := s.importCookiesToRedisSharded(ctx, mode, lines)
+	res, err := s.importCookiesToDBSharded(ctx, mode, lines)
 	if err != nil {
 		writeJSONAny(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -191,18 +154,8 @@ func (s *Server) handleAdminClearCookies(w http.ResponseWriter, r *http.Request)
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
 	defer cancel()
-	base := getStartupCookiePoolPrefix()
-	shards := getCookiePoolShards()
-	for i := 0; i < shards; i++ {
-		p := cookiePoolPrefixByIdx(base, i)
-		if err := s.clearStartupCookiePool(ctx, p); err != nil {
-			writeHTML(w, http.StatusInternalServerError, "redis error: "+err.Error())
-			return
-		}
-	}
-	// 兼容：也清一次 base（防止 shards=0/1 配置错误时漏清）
-	if err := s.clearStartupCookiePool(ctx, base); err != nil {
-		writeHTML(w, http.StatusInternalServerError, "redis error: "+err.Error())
+	if err := s.clearCookieAccounts(ctx); err != nil {
+		writeHTML(w, http.StatusInternalServerError, "db error: "+err.Error())
 		return
 	}
 	writeHTML(w, http.StatusOK, "ok")
@@ -213,28 +166,16 @@ func (s *Server) handleAdminCookiesStats(w http.ResponseWriter, r *http.Request)
 		w.WriteHeader(http.StatusMethodNotAllowed)
 		return
 	}
-	cache, err := s.redisClient()
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	stats, err := s.getPoolsStatsDB(ctx)
 	if err != nil {
 		writeJSONAny(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	base := getStartupCookiePoolPrefix()
-	shards := getCookiePoolShards()
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-	var total int64
-	per := make([]map[string]any, 0, shards)
-	for i := 0; i < shards; i++ {
-		p := cookiePoolPrefixByIdx(base, i)
-		n, err := cache.rdb.SCard(ctx, p+":ids").Result()
-		if err != nil {
-			writeJSONAny(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
-			return
-		}
-		total += n
-		per = append(per, map[string]any{"idx": i, "prefix": p, "count": n})
-	}
-	writeJSONAny(w, http.StatusOK, map[string]any{"count": total, "per_shard": per, "shards": shards})
+	// 兼容：只返回 cookies 维度
+	m := stats.(map[string]any)
+	writeJSONAny(w, http.StatusOK, m["cookies"])
 }
 
 func (s *Server) handleAdminPoolsStats(w http.ResponseWriter, r *http.Request) {
@@ -244,7 +185,7 @@ func (s *Server) handleAdminPoolsStats(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	stats, err := s.getPoolsStats(ctx)
+	stats, err := s.getPoolsStatsDB(ctx)
 	if err != nil {
 		writeJSONAny(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

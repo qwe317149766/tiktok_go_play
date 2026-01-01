@@ -40,7 +40,7 @@ func getDB() (*sql.DB, error) {
 	port := envStr("DB_PORT", "3306")
 	user := envStr("DB_USER", "root")
 	pass := envStr("DB_PASSWORD", "123456")
-	name := envStr("DB_NAME", "tiktok_play")
+	name := envStr("DB_NAME", "tiktok_go_play")
 
 	// parseTime=true 方便扫描时间字段（虽然我们这里主要用不到）
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%s)/%s?parseTime=true&charset=utf8mb4&collation=utf8mb4_unicode_ci",
@@ -230,21 +230,11 @@ func runOrderMode() {
 		}
 
 		remaining := order.Quantity - order.Delivered
-		// 崩溃恢复：以 Redis 的 delivered 为准（若更大则回写 DB 并更新本地 remaining）
-		if rd, _, ok, err := getOrderDeliveredFromRedis(order.OrderID); err == nil && ok {
-			if rd > order.Delivered {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				_ = setOrderDeliveredAtLeast(ctx, db, order.OrderID, rd)
-				cancel()
-				order.Delivered = rd
-			}
-		}
 		remaining = order.Quantity - order.Delivered
 		if remaining <= 0 {
 			ctx2, cancel2 := context.WithTimeout(context.Background(), 5*time.Second)
 			_ = finalizeOrderStatus(ctx2, db, order.OrderID)
 			cancel2()
-			_ = deleteOrderProgressInRedis(order.OrderID)
 			continue
 		}
 
@@ -266,10 +256,9 @@ func runOrderMode() {
 			continue
 		}
 
-		// 订单进度：成功一次就写 redis + 累加本地 delta
+		// 订单进度：全 DB 模式只累加本地 delta，定期 flush 到 MySQL
 		engine.onPlaySuccess = func() {
 			atomic.AddInt64(&delta, 1)
-			_ = incrOrderDeliveredInRedis(order.OrderID, 1, order.Quantity)
 		}
 
 		// DB 定期 flush（减少意外退出损失）
@@ -315,7 +304,6 @@ func runOrderMode() {
 		ctx2, cancel2 := context.WithTimeout(context.Background(), 8*time.Second)
 		_ = finalizeOrderStatus(ctx2, db, order.OrderID)
 		cancel2()
-		_ = deleteOrderProgressInRedis(order.OrderID)
 	}
 }
 

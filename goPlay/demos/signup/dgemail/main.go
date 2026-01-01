@@ -48,10 +48,8 @@ func main() {
 
 	// 载入 env（优先读取 dgemail 目录或仓库根目录的 env.windows/env.linux）
 	loadEnvForDemo()
-	// 支持按启动参数切分库（与 stats 一致）：go run . <deviceIdx> [cookieIdx]
-	applyRedisPoolShardFromArgs(os.Args)
 
-	// 轮询补齐模式：检查 Redis cookies 池缺口，自动补齐（Linux 默认开启；Windows 可用 DGEMAIL_POLL_MODE=1 调试）
+	// 轮询补齐模式：检查 DB cookies 池缺口，自动补齐（建议 run-once + cron 调度）
 	if dgemailPollEnabled() {
 		runCookiePollLoop()
 		return
@@ -74,50 +72,25 @@ func main() {
 
 	// 2. 读取设备列表
 	var devices []map[string]interface{}
-	if shouldLoadDevicesFromRedis() {
+	// 全 DB 模式：signup 设备固定从 MySQL 设备池读取
+	if shouldLoadDevicesFromDB() {
 		limit := getEnvInt("DEVICES_LIMIT", getEnvInt("MAX_GENERATE", 0))
-		devices, err = loadDevicesFromRedis(limit)
+		devices, err = loadDevicesFromDB(limit)
 		if err != nil {
-			log.Fatalf("从Redis读取设备失败: %v", err)
+			log.Fatalf("从MySQL读取设备失败: %v", err)
 		}
-		fmt.Printf("已从Redis加载 %d 个设备\n", len(devices))
+		fmt.Printf("已从MySQL加载 %d 个设备\n", len(devices))
 	} else {
-		// 设备文件路径（文件模式）
-		// 优先级：
-		// - DEVICES_FILE（统一配置，推荐）
-		// - SIGNUP_DEVICES_FILE（signup 专用，兼容）
-		// - 向上查找仓库根目录的 devices.txt
-		// - 旧默认：data/devices.txt
-		devPath := strings.TrimSpace(getEnvStr("DEVICES_FILE", ""))
-		if devPath == "" {
-			devPath = strings.TrimSpace(getEnvStr("SIGNUP_DEVICES_FILE", ""))
-		}
-		if devPath == "" {
-			devPath = findTopmostFileUpwards("devices.txt", 8)
-		}
-		if devPath == "" {
-			devPath = "data/devices.txt"
-		}
-		devices, err = loadDevices(devPath)
-		if err != nil {
-			log.Fatalf("读取设备列表失败: %v", err)
-		}
-		// 设备最小年龄筛选（create_time 早于 N 小时）
-		if h := getSignupDeviceMinAgeHours(); h > 0 {
-			devices = filterDevicesByMinAge(devices, h)
-			fmt.Printf("已从文件加载 %d 个设备（create_time 早于 %d 小时）\n", len(devices), h)
-		} else {
-			fmt.Printf("已从文件加载 %d 个设备\n", len(devices))
-		}
+		log.Fatalf("SIGNUP_DEVICES_SOURCE 未配置为 db/mysql：当前版本已移除 file/redis 设备来源，请设置 SIGNUP_DEVICES_SOURCE=db")
 	}
 	if err != nil {
 		log.Fatalf("读取设备列表失败: %v", err)
 	}
 
-	// Redis 模式：在 loadDevicesFromRedis 内已做筛选；这里补一句可观测日志
-	if shouldLoadDevicesFromRedis() {
+	// DB 模式：在 loadDevicesFromDB 内已做筛选；这里补一句可观测日志
+	if shouldLoadDevicesFromDB() {
 		if h := getSignupDeviceMinAgeHours(); h > 0 {
-			fmt.Printf("设备已按 create_time 早于 %d 小时筛选（redis 模式）\n", h)
+			fmt.Printf("设备已按 create_time 早于 %d 小时筛选（db 模式）\n", h)
 		}
 	}
 
@@ -177,10 +150,7 @@ func main() {
 	fmt.Printf("并发数: %d (来自 SIGNUP_CONCURRENCY)\n", maxConcurrency)
 	fmt.Println()
 
-	// 启动“账号池实时写入”后台协程（注册成功就写入 startup_cookie_pool），避免 stats 等到整批结束
-	if s := getStartupAccountStream(); s != nil {
-		defer s.Stop()
-	}
+	// DB 模式：注册成功会直接写入 MySQL cookies 池（startup_cookie_accounts）
 
 	// 5. 开始并发注册
 	startTime := time.Now()
@@ -204,22 +174,10 @@ func main() {
 	saveResultsJSONLFixed()
 
 	// 8. 组装“注册成功账号数据”（设备字段 + cookies 字段）
-	// 注意：你要求 stats 直接从账号池读取设备+cookies，因此这里的账号数据是后续写入 startup_cookie_pool 的内容。
+	// 注意：你要求 stats 直接从账号池读取设备+cookies，因此这里的账号数据会写入 MySQL cookies 池表（startup_cookie_accounts）。
 	startupDevs := buildStartupDevicesWithCookies(devices, results)
-
-	// 9. （可选）将 startUp 注册成功的“账号池数据”写入 Redis（使用 startup_cookie_pool 的 key 结构）
-	if n, err := saveStartupCookiesToRedis(startupDevs, 0); err != nil {
-		log.Fatalf("写入startUp cookies到Redis失败: %v", err)
-	} else if n > 0 {
-		fmt.Printf("已写入 %d 份 startUp 账号数据 到 Redis(REDIS_STARTUP_COOKIE_POOL_KEY)\n", n)
-	}
-
-	// 10. （可选）将 startUp 注册成功的 devices 写入 Redis 设备池（兼容旧逻辑/备用，不再作为 stats 的默认来源）
-	if n, err := saveStartupDevicesToRedis(startupDevs); err != nil {
-		log.Fatalf("写入startUp devices到Redis失败: %v", err)
-	} else if n > 0 {
-		fmt.Printf("已写入 %d 个 startUp devices 到 Redis 设备池(%s)\n", n, getEnvStr("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool"))
-	}
+	// DB 模式：账号池写入在注册成功时已完成；这里保留 startupDevs 仅用于文件输出/对账。
+	_ = startupDevs
 }
 
 // startupDevicesWithCookiesOutPath 生成“类似 devices12_20.txt 的文件名”，用于保存 signup 成功账号 JSON（每行一个）
@@ -440,21 +398,23 @@ func registerAccounts(accounts []AccountInfo, devices []map[string]interface{}, 
 			if result.Success {
 				atomic.AddInt64(&successCount, 1)
 				// ✅ 注册成功立刻构造“账号 JSON（完整设备字段+cookies+create_time）”
-				// 要求：写入 Redis 的 JSON 必须与写入文件的 JSON 一致
+				// 要求：写入 DB/文件 的 JSON 必须一致
 				if len(result.Cookies) > 0 {
 					accJSON := buildStartupAccountJSON(deviceRaw, result.Cookies)
-					// 1) 实时写入 Redis 账号池（避免 stats 等到整批结束）
-					if startupAccountStreamEnabled() {
-						enqueueStartupAccountForRedis(accJSON)
+					// 1) 写入 MySQL cookies 池（全 DB 模式）
+					if shouldWriteStartupAccountsToDB() {
+						if err := writeStartupAccountToDB(accJSON); err != nil {
+							log.Printf("[db] 写入 startup_cookie_accounts 失败: %v", err)
+						}
 					}
-					// 2) 实时写入 Log/ startup_accounts_*.jsonl（与 Redis 完全一致）
+					// 2) 实时写入 Log/ startup_accounts_*.jsonl（与 DB 完全一致）
 					appendStartupAccountJSONLFixed(accJSON)
 				}
-				// ✅ signup 设备淘汰策略：成功次数 >3 删设备；连续失败 >10 也删设备（仅 Redis 设备池模式生效）
+				// ✅ signup 设备淘汰策略：成功次数 >3 删设备；连续失败 >10 也删设备
 				signupDeviceUsageUpdate(result.DeviceID, true)
 			} else {
 				atomic.AddInt64(&failedCount, 1)
-				// ✅ 连续失败计数（仅 Redis 设备池模式生效）
+				// ✅ 连续失败计数
 				signupDeviceUsageUpdate(result.DeviceID, false)
 			}
 
@@ -470,13 +430,18 @@ func registerAccounts(accounts []AccountInfo, devices []map[string]interface{}, 
 
 // registerSingleAccount 注册单个账号（带重试机制）
 func registerSingleAccount(account AccountInfo, device map[string]string, proxy string, current, total int) RegisterResult {
+	// device key：优先 device_id；缺失时回退 cdid（用于 DB 设备池删除/计数一致性）
+	deviceKey := strings.TrimSpace(device["device_id"])
+	if deviceKey == "" {
+		deviceKey = strings.TrimSpace(device["cdid"])
+	}
 	result := RegisterResult{
 		Email:    account.Email,
-		DeviceID: device["device_id"],
+		DeviceID: deviceKey,
 		Proxy:    proxy,
 	}
 
-	fmt.Printf("[%d/%d] 开始注册: %s (设备: %s, 代理: %s)\n", current, total, account.Email, device["device_id"], proxy)
+	fmt.Printf("[%d/%d] 开始注册: %s (设备: %s, 代理: %s)\n", current, total, account.Email, deviceKey, proxy)
 
 	// 获取 seed 和 seedType（带重试，最多10次，优先成功率）
 	var seed string

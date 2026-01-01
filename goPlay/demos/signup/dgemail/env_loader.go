@@ -9,7 +9,7 @@ import (
 	"github.com/joho/godotenv"
 )
 
-// loadEnvForDemo 尝试加载 env 文件，使 Go demo 复用 Python 同一套 REDIS_* / MAX_GENERATE 等配置。
+// loadEnvForDemo 尝试加载 env 文件，使 Go demo 复用仓库统一配置（全 DB 模式：DB_* / MAX_GENERATE 等）。
 //
 // 加载优先级：
 // 1) ENV_FILE 显式指定

@@ -56,7 +56,7 @@ func loadConfig() Config {
 		DBPort: getenvInt("DB_PORT", 3306),
 		DBUser: getenv("DB_USER", "root"),
 		DBPass: getenv("DB_PASSWORD", "123456"),
-		DBName: getenv("DB_NAME", "tiktok_play"),
+		DBName: getenv("DB_NAME", "tiktok_go_play"),
 
 		// 管理后台密码：存放“明文密码的 MD5(hex小写)”
 		AdminPasswordMD5: strings.ToLower(getenv("ADMIN_PASSWORD_MD5", "")),

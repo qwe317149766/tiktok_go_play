@@ -12,9 +12,15 @@ import (
 )
 
 func dgemailPollEnabled() bool {
-	// 默认：Linux 开启轮询补齐；其它系统不开启（可用 DGEMAIL_POLL_MODE=1 强制开启调试）
+	// 默认：Linux 开启补齐（但采用 run-once，不常驻）；其它系统不开启（可用 DGEMAIL_POLL_MODE=1 调试）
 	def := runtime.GOOS == "linux"
 	return getEnvBool("DGEMAIL_POLL_MODE", def)
+}
+
+func dgemailPollOnce() bool {
+	// 持续轮询模式：默认 false（一直轮询，不退出）
+	// 设置为 true 时，只跑一轮就退出（适合 cron 调度）
+	return getEnvBool("DGEMAIL_POLL_ONCE", false)
 }
 
 func dgemailPollIntervalSec() int {
@@ -34,14 +40,9 @@ func dgemailPollBatchMax() int {
 }
 
 func dgemailTargetCookies() int {
-	// 目标 cookies 池大小（每个池的“最终数量”）优先级：
-	// REDIS_MAX_COOKIES > STARTUP_REGISTER_COUNT > MAX_GENERATE
-	//
-	// 兼容旧参数：REDIS_TARGET_COOKIES（已废弃，如配置会被忽略并提示）
-	if legacy := getEnvInt("REDIS_TARGET_COOKIES", 0); legacy > 0 {
-		log.Printf("[poll] 检测到已废弃配置 REDIS_TARGET_COOKIES=%d，将忽略并优先使用 REDIS_MAX_COOKIES", legacy)
-	}
-	if v := getEnvInt("REDIS_MAX_COOKIES", 0); v > 0 {
+	// 目标 cookies 池大小（每个 shard 的最终数量）优先级：
+	// DB_MAX_COOKIES > STARTUP_REGISTER_COUNT > MAX_GENERATE
+	if v := getEnvInt("DB_MAX_COOKIES", 0); v > 0 {
 		return v
 	}
 	if v := getEnvInt("STARTUP_REGISTER_COUNT", 0); v > 0 {
@@ -53,104 +54,54 @@ func dgemailTargetCookies() int {
 	return 0
 }
 
-func getCookiePoolShards() int {
-	n := getEnvInt("REDIS_COOKIE_POOL_SHARDS", 1)
-	if n <= 0 {
-		return 1
-	}
-	return n
-}
-
-func getStartupCookiePoolCount(prefix string) (int, error) {
-	// 轮询模式在高并发/Redis 负载高时，SCARD 也可能变慢；统一用更大的 load timeout
-	ctx, cancel := context.WithTimeout(context.Background(), redisLoadTimeout())
-	defer cancel()
-	rdb, err := newRedisClient()
+func getStartupCookiePoolCountDB(ctx context.Context, shard int) (int, error) {
+	db, err := getSignupDB()
 	if err != nil {
-		return 0, fmt.Errorf("redis init: %w", err)
+		return 0, fmt.Errorf("mysql init: %w", err)
 	}
-	defer rdb.Close()
-	idsKey := strings.TrimSpace(prefix) + ":ids"
-	n, err := rdb.SCard(ctx, idsKey).Result()
-	if err != nil {
-		return 0, fmt.Errorf("redis scard: %w", err)
+	tbl := cookiePoolTable()
+	var n int
+	if err := db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM `%s` WHERE shard_id=?", tbl), shard).Scan(&n); err != nil {
+		return 0, err
 	}
-	return int(n), nil
+	return n, nil
 }
 
 func runCookiePollLoop() {
-	if !getEnvBool("SAVE_STARTUP_COOKIES_TO_REDIS", false) {
-		log.Fatalf("[poll] DGEMAIL_POLL_MODE 打开时必须同时打开 SAVE_STARTUP_COOKIES_TO_REDIS=1（否则补齐没有意义）")
+	// 全 DB：必须写入 MySQL cookies 池
+	if !shouldWriteStartupAccountsToDB() {
+		log.Fatalf("[poll] DGEMAIL_POLL_MODE 打开时必须同时打开 SAVE_STARTUP_COOKIES_TO_DB=1 或 COOKIES_SINK=db（否则补齐没有意义）")
+	}
+	// 全 DB：必须从 MySQL 读设备池
+	if !shouldLoadDevicesFromDB() {
+		log.Fatalf("[poll] 全 DB 模式下必须配置 SIGNUP_DEVICES_SOURCE=db")
 	}
 
 	target := dgemailTargetCookies()
 	if target <= 0 {
-		log.Fatalf("[poll] 目标 cookies 数量无效：请配置 REDIS_TARGET_COOKIES 或 REDIS_MAX_COOKIES 或 STARTUP_REGISTER_COUNT/MAX_GENERATE")
+		log.Fatalf("[poll] 目标 cookies 数量无效：请配置 DB_MAX_COOKIES 或 STARTUP_REGISTER_COUNT/MAX_GENERATE")
 	}
+
 	interval := dgemailPollIntervalSec()
 	batchMax := dgemailPollBatchMax()
-	shards := getCookiePoolShards()
-	baseCookiePrefix := normalizePoolBase(getEnvStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool"))
-	if baseCookiePrefix == "" {
-		baseCookiePrefix = "tiktok:startup_cookie_pool"
-	}
-	baseDevPrefix := normalizePoolBase(getEnvStr("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool"))
-	if baseDevPrefix == "" {
-		baseDevPrefix = "tiktok:device_pool"
-	}
-	log.Printf("[poll] 启动：interval=%ds target=%d batch_max=%d shards=%d cookie_base=%s device_base=%s",
-		interval, target, batchMax, shards, baseCookiePrefix, baseDevPrefix)
+	shards := dbCookieShards()
+	runOnce := dgemailPollOnce()
+
+	log.Printf("[poll] 启动(DB)：once=%v interval=%ds target(per_shard)=%d batch_max=%d shards=%d cookie_table=%s device_table=%s",
+		runOnce, interval, target, batchMax, shards, cookiePoolTable(), devicePoolTable())
 
 	// 预加载设备与代理（减少每轮开销）
-	var devices []map[string]interface{}
-	var err error
-	if shouldLoadDevicesFromRedis() {
-		limit := getEnvInt("DEVICES_LIMIT", getEnvInt("MAX_GENERATE", 0))
-		devices, err = loadDevicesFromRedis(limit)
-		if err != nil {
-			log.Fatalf("[poll] 从Redis读取设备失败: %v", err)
-		}
-		log.Printf("[poll] 已从Redis加载 %d 个设备", len(devices))
-	} else {
-		// 设备文件路径（文件模式）对齐 main.go：
-		// 优先级：
-		// - DEVICES_FILE（统一配置，推荐）
-		// - SIGNUP_DEVICES_FILE（signup 专用，兼容）
-		// - 向上查找仓库根目录的 devices.txt
-		// - 旧默认：data/devices.txt
-		devPath := strings.TrimSpace(getEnvStr("DEVICES_FILE", ""))
-		if devPath == "" {
-			devPath = strings.TrimSpace(getEnvStr("SIGNUP_DEVICES_FILE", ""))
-		}
-		if devPath == "" {
-			devPath = findTopmostFileUpwards("devices.txt", 8)
-		}
-		if devPath == "" {
-			devPath = "data/devices.txt"
-		}
-		devices, err = loadDevices(devPath)
-		if err != nil {
-			log.Fatalf("[poll] 读取设备列表失败: %v", err)
-		}
-		// 设备最小年龄筛选（create_time 早于 N 小时）
-		if h := getSignupDeviceMinAgeHours(); h > 0 {
-			devices = filterDevicesByMinAge(devices, h)
-			log.Printf("[poll] 已从文件加载 %d 个设备（create_time 早于 %d 小时）", len(devices), h)
-		} else {
-			log.Printf("[poll] 已从文件加载 %d 个设备", len(devices))
-		}
+	limit := getEnvInt("DEVICES_LIMIT", getEnvInt("MAX_GENERATE", 0))
+	devices, err := loadDevicesFromDB(limit)
+	if err != nil {
+		log.Fatalf("[poll] 从MySQL读取设备失败: %v", err)
 	}
 	if len(devices) == 0 {
 		log.Fatalf("[poll] 设备列表为空，无法补齐 cookies")
 	}
+	log.Printf("[poll] 已从MySQL加载 %d 个设备", len(devices))
 
-	// 轮询补齐模式同样需要代理：优先读取 dgemail 自己目录下的代理（避免误读仓库根目录的 proxies.txt）
-	// 优先级与 main.go 对齐：
-	// - PROXIES_FILE
-	// - SIGNUP_PROXIES_FILE
-	// - 当前目录 proxies.txt
-	// - 当前目录 data/proxies.txt
-	// - 向上查找仓库根目录 proxies.txt（兜底兼容）
+	// 代理
 	proxyPath := strings.TrimSpace(getEnvStr("PROXIES_FILE", ""))
 	if proxyPath == "" {
 		proxyPath = strings.TrimSpace(getEnvStr("SIGNUP_PROXIES_FILE", ""))
@@ -178,108 +129,118 @@ func runCookiePollLoop() {
 		maxConcurrency = 50
 	}
 
-	for {
-		// 扫描每个 cookies 池的数量，选择“未满且数量最少”的池补货
+	for round := 0; ; round++ {
+		// 统计每个 shard 缺口
 		type poolInfo struct {
-			cur    int
-			idx    int
-			prefix string
+			cur     int
+			idx     int
+			missing int
 		}
-		var pools []poolInfo
-		scanOK := true
+		pools := make([]poolInfo, 0, shards)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		for i := 0; i < shards; i++ {
-			prefix := baseCookiePrefix
-			if i > 0 {
-				prefix = fmt.Sprintf("%s:%d", baseCookiePrefix, i)
-			}
-			cur, err := getStartupCookiePoolCount(prefix)
+			cur, err := getStartupCookiePoolCountDB(ctx, i)
 			if err != nil {
-				// 轮询模式不应因临时 Redis 抖动直接退出：记录后 sleep，下一轮重试
-				log.Printf("[poll] Redis 读取 cookies 池数量失败 prefix=%s err=%v；sleep %ds 后重试", prefix, err, interval)
-				scanOK = false
-				break
-			}
-			pools = append(pools, poolInfo{cur: cur, idx: i, prefix: prefix})
-		}
-		if !scanOK {
-			time.Sleep(time.Duration(interval) * time.Second)
-			continue
-		}
-		// 找最少且未满
-		chosen := poolInfo{cur: 0, idx: -1, prefix: ""}
-		for _, p := range pools {
-			if p.cur >= target {
+				cancel()
+				log.Printf("[poll] DB 读取 cookies 池数量失败 shard=%d err=%v；sleep %ds 后重试", i, err, interval)
+				time.Sleep(time.Duration(interval) * time.Second)
 				continue
 			}
-			if chosen.idx == -1 || p.cur < chosen.cur {
+			missing := target - cur
+			if missing < 0 {
+				missing = 0
+			}
+			log.Printf("[poll] shard=%d cur=%d target=%d missing=%d", i, cur, target, missing)
+			pools = append(pools, poolInfo{cur: cur, idx: i, missing: missing})
+		}
+		cancel()
+
+		// 选缺口最大的 shard（优先补最缺的）
+		chosen := poolInfo{idx: -1, cur: 0, missing: 0}
+		for _, p := range pools {
+			if p.missing <= 0 {
+				continue
+			}
+			if chosen.idx == -1 || p.missing > chosen.missing {
 				chosen = p
 			}
 		}
 		if chosen.idx == -1 {
-			log.Printf("[poll] 所有 cookies 池已满（每池 target=%d）sleep %ds", target, interval)
+			// 所有 shard 已满足，休眠后继续轮询（不退出）
+			log.Printf("[poll] 所有 cookies shard 已满足 target=%d（per_shard），休眠 %ds 后继续检查", target, interval)
+			if runOnce {
+				log.Printf("[poll] run-once 模式：退出")
+				return
+			}
 			time.Sleep(time.Duration(interval) * time.Second)
 			continue
 		}
 
-		missing := target - chosen.cur
-		fill := missing
+		fill := chosen.missing
 		if fill > batchMax {
 			fill = batchMax
 		}
-		log.Printf("[poll] 选择池 idx=%d prefix=%s cur=%d target=%d missing=%d -> 本轮补齐 %d", chosen.idx, chosen.prefix, chosen.cur, target, missing, fill)
 
-		// 本轮写入到选中的 cookies 池
-		_ = os.Setenv("REDIS_STARTUP_COOKIE_POOL_KEY", chosen.prefix)
-	// device 池默认不分库：保持不变，只按 cookies 分库补齐
-	log.Printf("[poll] 本轮写入 cookie_shard=%d -> cookie_prefix=%s | device_prefix=%s(不分库)",
-		chosen.idx, chosen.prefix, baseDevPrefix)
+		// 强制写入到选中的 shard
+		_ = os.Setenv("DGEMAIL_COOKIE_SHARD", fmt.Sprintf("%d", chosen.idx))
+		log.Printf("[poll] round=%d choose_shard=%d cur=%d missing=%d -> fill=%d (DGEMAIL_COOKIE_SHARD=%d)",
+			round, chosen.idx, chosen.cur, chosen.missing, fill, chosen.idx)
 
-		// 每轮都用不重复账号（避免复用/重复导致注册失败）
 		accounts := generateUniqueAccounts(fill)
+		if len(accounts) == 0 {
+			log.Printf("[poll] round=%d 警告：generateUniqueAccounts 返回空列表（fill=%d），休眠 %ds 后重试", round, fill, interval)
+			if runOnce {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+			continue
+		}
+		if len(devices) == 0 {
+			log.Printf("[poll] round=%d 错误：设备列表为空，无法注册，休眠 %ds 后重试", round, interval)
+			if runOnce {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+			continue
+		}
+		if len(proxies) == 0 {
+			log.Printf("[poll] round=%d 错误：代理列表为空，无法注册，休眠 %ds 后重试", round, interval)
+			if runOnce {
+				return
+			}
+			time.Sleep(time.Duration(interval) * time.Second)
+			continue
+		}
 
-		// 重置全局结果，避免轮询模式下内存增长
-		atomicStoreZero()
-		clearResults()
+		log.Printf("[poll] round=%d 开始注册：accounts=%d devices=%d proxies=%d concurrency=%d",
+			round, len(accounts), len(devices), len(proxies), maxConcurrency)
+
+		// 重置全局结果（避免轮询模式内存增长）
+		atomic.StoreInt64(&totalCount, 0)
+		atomic.StoreInt64(&successCount, 0)
+		atomic.StoreInt64(&failedCount, 0)
+		resultMutex.Lock()
+		results = nil
+		resultMutex.Unlock()
 
 		startTime := time.Now()
 		registerAccounts(accounts, devices, proxies, maxConcurrency)
 		duration := time.Since(startTime)
+		success := atomic.LoadInt64(&successCount)
+		failed := atomic.LoadInt64(&failedCount)
+		log.Printf("[poll] round=%d done: took=%v success=%d failed=%d (target_fill=%d shard=%d)",
+			round, duration, success, failed, fill, chosen.idx)
 
-		// 本轮写入 Redis（强制按 fill 写入上限）
-		// 写“账号池数据”（完整设备字段 + cookies 字段）
-		startupAccounts := buildStartupDevicesWithCookies(devices, results)
-		if n, err := saveStartupCookiesToRedis(startupAccounts, fill); err != nil {
-			log.Printf("[poll] 写入startUp cookies到Redis失败: %v；sleep %ds 后重试", err, interval)
-			time.Sleep(time.Duration(interval) * time.Second)
-			continue
-		} else {
-			log.Printf("[poll] 本轮写入 cookies=%d（目标补齐=%d）耗时=%v 成功=%d 失败=%d pool_idx=%d", n, fill, duration, atomicLoadSuccess(), atomicLoadFailed(), chosen.idx)
+		// run-once：只跑一轮就退出（交给 cron 再跑）
+		if runOnce {
+			log.Printf("[poll] run-once 模式：退出")
+			return
 		}
-
-		// 同步把本轮“注册成功的设备”也写入 Redis 设备池（供 stats 从 Redis 取设备）
-		startupDevs := startupAccounts
-		if dn, derr := saveStartupDevicesToRedis(startupDevs); derr != nil {
-			log.Printf("[poll] 写入startUp devices到Redis失败: %v；本轮 cookies 已写入，继续下一轮", derr)
-		} else if dn > 0 {
-			log.Printf("[poll] 本轮写入 devices=%d 到 Redis 设备池(%s)", dn, getEnvStr("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool"))
-		}
-		// 立即进入下一轮检查（不额外 sleep）
+		// 持续轮询模式：处理完毕后立即重新检查（不 sleep，直接进入下一轮循环）
+		// 只有在"没有数据要处理"时才会 sleep（见上面的 continue 逻辑）
+		log.Printf("[poll] round=%d 处理完成，立即重新检查 cookies 池状态", round)
+		// 不 sleep，直接 continue 进入下一轮循环
 	}
-}
-
-func atomicStoreZero() {
-	atomic.StoreInt64(&totalCount, 0)
-	atomic.StoreInt64(&successCount, 0)
-	atomic.StoreInt64(&failedCount, 0)
-}
-
-func atomicLoadSuccess() int64 { return atomic.LoadInt64(&successCount) }
-func atomicLoadFailed() int64  { return atomic.LoadInt64(&failedCount) }
-
-func clearResults() {
-	resultMutex.Lock()
-	results = nil
-	resultMutex.Unlock()
 }
 
 

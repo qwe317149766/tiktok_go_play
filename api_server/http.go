@@ -45,7 +45,7 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing key"})
 		return
 	}
-	// Redis 永久缓存校验：优先读 redis，miss 再回源 DB 并回填 redis
+	// 全 DB：进程内 TTL cache 校验：优先读 cache，miss 再回源 DB 并回填 cache
 	apiKeyRow, err := s.validateAPIKey(r.Context(), key)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -104,7 +104,7 @@ func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request, apiKey string
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "db error"})
 		return
 	}
-	// 额度扣减成功后：刷新并回填 redis（避免永久缓存变脏）
+	// 额度扣减成功后：刷新 cache（避免缓存变脏）
 	_ = s.refreshAPIKeyCache(r.Context(), apiKey)
 
 	// API.md: {"order":"12421"}
@@ -115,7 +115,7 @@ func (s *Server) validateAPIKey(parent context.Context, key string) (*APIKeyRow,
 	ctx, cancel := withTimeout(parent)
 	defer cancel()
 
-	// 1) Redis hit
+	// 1) cache hit
 	if s.cache != nil {
 		if row, ok, err := s.cache.Get(ctx, key); err == nil && ok {
 			return row, nil
@@ -128,7 +128,7 @@ func (s *Server) validateAPIKey(parent context.Context, key string) (*APIKeyRow,
 		return nil, err
 	}
 
-	// 3) 回填 redis（永久缓存）
+	// 3) 回填 cache
 	if s.cache != nil {
 		_ = s.cache.Set(ctx, row)
 	}
