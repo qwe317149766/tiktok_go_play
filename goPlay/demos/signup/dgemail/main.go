@@ -429,10 +429,12 @@ func registerAccounts(accounts []AccountInfo, devices []map[string]interface{}, 
 				if len(result.Cookies) > 0 {
 					accJSON := buildStartupAccountJSON(deviceRaw, result.Cookies)
 					// 1) 写入 MySQL cookies 池（全 DB 模式）
-					if shouldWriteStartupAccountsToDB() {
-						if err := writeStartupAccountToDB(accJSON); err != nil {
-							log.Printf("[db] 写入 startup_cookie_accounts 失败: %v", err)
-						}
+					// 1) 写入 MySQL cookies 池（全 DB 模式）
+					// 强制写入数据库
+					if err := writeStartupAccountToDB(accJSON); err != nil {
+						fmt.Printf("❌ [数据库] 写入失败: %v\n", err)
+					} else {
+						fmt.Printf("✅ [数据库] 写入成功: %s\n", result.DeviceID)
 					}
 					// 2) 实时写入 Log/ startup_accounts_*.jsonl（与 DB 完全一致）
 					appendStartupAccountJSONLFixed(accJSON)
