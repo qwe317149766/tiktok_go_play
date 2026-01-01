@@ -57,7 +57,7 @@ func (cm *CookieManager) RecordSuccess(cookieID string) {
 }
 
 // RecordFailure - 网络错误不计入连续失败（避免短期网络抖动误判）
-// 如果连续失败达到阈值，会从内存中删除并异步更新数据库
+// 如果连续失败达到阈值，会从内存中删除并异步删除数据库记录
 func (cm *CookieManager) RecordFailure(cookieID string, isNetworkError bool) {
 	if cookieID == "" || cookieID == "default" {
 		return
@@ -72,12 +72,15 @@ func (cm *CookieManager) RecordFailure(cookieID string, isNetworkError bool) {
 	atomic.AddInt64(&stat.TotalFailed, 1)
 	if !isNetworkError {
 		newFailures := atomic.AddInt64(&stat.ConsecutiveFailures, 1)
-		// 如果连续失败达到阈值，从内存中删除并异步更新数据库
+		// 如果连续失败达到阈值，从内存中删除并从数据库彻底删除
 		if newFailures >= cookieFailThreshold {
 			// 从内存中删除
 			removeCookieFromPool(cookieID)
-			// 异步更新数据库（不阻塞）
-			go updateCookieFailCountInDB(cookieID, newFailures)
+			// 彻底从数据库删除（不只是更新计数），防止下次重启再被加载
+			go func() {
+				// 调用 db_pool.go 中的删除函数
+				_ = deleteDeviceFromDB(cookieID)
+			}()
 		}
 	}
 }
@@ -98,5 +101,3 @@ func (cm *CookieManager) IsHealthy(cookieID string) bool {
 	}
 	return atomic.LoadInt64(&stat.ConsecutiveFailures) < cookieFailThreshold
 }
-
-
