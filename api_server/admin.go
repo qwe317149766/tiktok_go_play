@@ -73,7 +73,7 @@ func (s *Server) handleAdminAddAPIKey(w http.ResponseWriter, r *http.Request) {
 		writeHTML(w, http.StatusInternalServerError, "db error: "+err.Error())
 		return
 	}
-	// 写入 redis 永久缓存（新增/更新后立即回填）
+	// 刷新进程内 cache（新增/更新后立即回填）
 	_ = s.refreshAPIKeyCache(r.Context(), apiKey)
 
 	writeHTML(w, http.StatusOK, "ok")
@@ -113,8 +113,8 @@ const adminHTML = `<!doctype html>
       </div>
 
       <div class="card">
-        <h2>池子统计（分库）</h2>
-        <p class="small">自动按 <code>REDIS_DEVICE_POOL_SHARDS</code> / <code>REDIS_COOKIE_POOL_SHARDS</code> 展示每个池子的数量。</p>
+        <h2>池子统计（分片）</h2>
+        <p class="small">自动按 <code>DB_DEVICE_POOL_SHARDS</code> / <code>DB_COOKIE_POOL_SHARDS</code> 展示每个 shard 的数量。</p>
         <div class="row">
           <button id="poolRefresh" type="button">刷新</button>
           <span class="small" id="poolHint"></span>
@@ -142,8 +142,8 @@ const adminHTML = `<!doctype html>
       </div>
 
       <div class="card">
-        <h2>批量导入设备到 Redis</h2>
-        <p class="small">支持文件上传或粘贴 JSONL（每行一个设备 JSON）。会按 <code>REDIS_DEVICE_POOL_SHARDS</code> 自动分配到各个设备池。模式：<code>overwrite</code>=全覆盖；<code>evict</code>=按淘汰策略腾位置。若容量不足，会在结果里返回“剩余设备”。</p>
+        <h2>批量导入设备到 MySQL</h2>
+        <p class="small">支持文件上传或粘贴 JSONL（每行一个设备 JSON）。会按 <code>DB_DEVICE_POOL_SHARDS</code> 自动写入 <code>device_pool_devices</code>（按 device_id 分片写入 shard_id）。模式：<code>overwrite</code>=全覆盖；<code>evict</code>=按 use_count 最大淘汰腾位置。若容量不足，会按 shard 淘汰到上限。</p>
         <form id="devForm">
           <label>管理员密码</label>
           <input name="password" type="password" autocomplete="current-password" required />
@@ -160,7 +160,7 @@ const adminHTML = `<!doctype html>
           <label>设备 JSONL（每行一个 JSON）</label>
           <textarea name="devices" placeholder='{"cdid":"...","create_time":"2025-12-31 01:11:00", ...}'></textarea>
 
-          <button type="submit">导入到 Redis</button>
+          <button type="submit">导入到 MySQL</button>
         </form>
         <div class="row" style="margin-top:10px;">
           <button id="devCopyRemain" type="button">复制剩余设备</button>
@@ -170,8 +170,8 @@ const adminHTML = `<!doctype html>
       </div>
 
       <div class="card">
-        <h2>批量导入 Cookies 到 Redis（startUp cookie 池）</h2>
-        <p class="small">支持文件上传或粘贴（每行一条）。会按 <code>REDIS_COOKIE_POOL_SHARDS</code> 自动分配到各个 cookies 池。格式：<code>k=v; k2=v2</code> 或 JSON <code>{"k":"v"}</code>。</p>
+        <h2>批量导入 Cookies 到 MySQL（startup_cookie_accounts）</h2>
+        <p class="small">支持文件上传或粘贴（每行一条）。会按 <code>DB_COOKIE_POOL_SHARDS</code> 自动写入 <code>startup_cookie_accounts</code>（按 cookie_id/device_key 分片写入 shard_id）。格式：<code>k=v; k2=v2</code> 或 JSON <code>{"k":"v"}</code>（也支持直接粘贴账号 JSON，自动取 cookies 字段）。</p>
         <form id="ckForm">
           <label>管理员密码</label>
           <input name="password" type="password" autocomplete="current-password" required />
@@ -189,10 +189,10 @@ const adminHTML = `<!doctype html>
           <label>Cookies（每行一条）</label>
           <textarea name="cookies" placeholder='sessionid=...; sid_tt=...&#10;{"sessionid":"...","sid_tt":"..."}'></textarea>
 
-          <button type="submit">导入到 Redis</button>
+          <button type="submit">导入到 MySQL</button>
         </form>
         <div class="row" style="margin-top:10px;">
-          <button id="ckClear" type="button">清空 Redis Cookies</button>
+          <button id="ckClear" type="button">清空 MySQL Cookies</button>
           <span class="small" id="ckStat"></span>
         </div>
         <div id="ckOut" class="out"></div>

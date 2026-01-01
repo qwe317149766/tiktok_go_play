@@ -1,57 +1,40 @@
 # 三个项目梳理 + 高并发利弊总结
 
-本文档面向仓库里三条主链路：
+本文档面向仓库里三条主链路（全 DB 模式）：
 
-- **Python 注册**：`mwzzzh_spider.py`（批量注册设备 → 写入 Redis 设备池 + 本地备份）
-- **Go startUp（signup）**：`goPlay/demos/signup/dgemail`（批量注册账号/拿 cookies → 写入 Redis cookies 池；支持轮询补齐、分库）
-- **Go stats（播放/抢单）**：`goPlay/demos/stats/dgmain3`（高并发播放请求；Redis 模式按需取设备/更换设备与 cookies；Linux 抢单模式）
+- **Python 注册**：`mwzzzh_spider.py`（批量注册设备 → 写入 MySQL 设备池 + 本地备份）
+- **Go startUp（signup）**：`goPlay/demos/signup/dgemail`（读 MySQL 设备池 → 批量注册账号/拿 cookies → 写入 MySQL cookies/账号池；支持轮询补齐、按 shard 分片）
+- **Go stats（播放/抢单）**：`goPlay/demos/stats/dgmain3`（从 MySQL cookies/账号池读取账号 JSON（device+cookies 同源）→ 高并发播放；Linux 抢单模式）
 
 ---
 
-## 1. 总体数据流（推荐：Redis 模式）
+## 1. 总体数据流（推荐：全 DB 模式）
 
 ### 1.1 设备流（device pool）
 - **生产**：`mwzzzh_spider.py` 注册成功得到 device JSON（包含 `seed/token` 等字段会被后续更新）
-- **落库**：写入 Redis 的 device pool（支持分库：`REDIS_DEVICE_POOL_SHARDS`）
-- **消费/更新**：`dgmain3` 播放时会：
-  - 从 Redis 按需加载 N 个设备到内存（N≈并发数）
-  - 运行中对设备做健康度判断与替换（连续失败/播放次数阈值）
-  - 把设备的 `seed/token/play_count/attempt_count/fail_count/...` **回写 Redis**，做到“统一设备状态源”
+- **落库**：写入 MySQL 表 `device_pool_devices`（按 `shard_id` 分片：`DB_DEVICE_POOL_SHARDS`）
+- **消费/淘汰**：`dgemail` 注册时从 MySQL 读取设备并更新 use/fail；坏设备会从表中删除
 
 ### 1.2 cookies 流（startup cookie pool）
 - **生产**：`dgemail` 注册成功得到 cookies（map 或字符串解析）
-- **落库**：写入 Redis 的 startup cookie pool（支持分库：`REDIS_COOKIE_POOL_SHARDS`）
-- **消费/更换**：`dgmain3` 播放时从 Redis 取 cookies；若 cookies 连续失败会自动更换；若池为空则回退到 `DEFAULT_COOKIES_JSON`
+- **落库**：写入 MySQL 表 `startup_cookie_accounts`（按 `shard_id` 分片：`DB_COOKIE_POOL_SHARDS`；每条为完整账号 JSON，包含 cookies 字段）
+- **消费**：`dgmain3` 直接读取账号 JSON 并抽取 cookies（确保 device+cookies 同源）
 
 ---
 
-## 2. Redis Key 结构（强约定）
+## 2. 数据结构（强约定）
 
 ### 2.1 设备池（device pool）
-以 `REDIS_DEVICE_POOL_KEY` 为前缀（例如 `tiktok:device_pool`）：
+MySQL 表：`device_pool_devices`（字段见 `api_server/schema.sql`）
 
-- **集合**：`{prefix}:ids`（SET）所有设备 id
-- **数据**：`{prefix}:data`（HASH）`id -> device_json`
-- **计数**：
-  - `{prefix}:use`（ZSET）`id -> use_count`
-  - `{prefix}:fail`（ZSET）`id -> fail_count`
-  - `{prefix}:play`（ZSET）`id -> play_count`
-  - `{prefix}:attempt`（ZSET）`id -> attempt_count`
+### 2.2 cookies/账号池（startup cookie accounts）
+MySQL 表：`startup_cookie_accounts`（字段见 `api_server/schema.sql`，每条 `account_json` 包含 cookies 字段）
 
-### 2.2 cookies 池（startup cookie pool）
-以 `REDIS_STARTUP_COOKIE_POOL_KEY` 为前缀（例如 `tiktok:startup_cookie_pool`）：
-
-- `{prefix}:ids`（SET）cookie id（优先 `sessionid` / `sid_tt`，否则 hash）
-- `{prefix}:data`（HASH）`id -> cookies_json`
-- `{prefix}:use`（ZSET）`id -> use_count`
-
-### 2.3 分库（shards）命名规则
-- **0 号池**：原始前缀不加后缀：`tiktok:device_pool`
-- **i 号池**：追加 `:{i}`：`tiktok:device_pool:1`
-
-控制参数：
-- **设备分库数**：`REDIS_DEVICE_POOL_SHARDS`
-- **cookies 分库数**：`REDIS_COOKIE_POOL_SHARDS`
+### 2.3 分片（shards）
+- 通过表字段 `shard_id` 分片
+- 控制参数：
+  - `DB_DEVICE_POOL_SHARDS`
+  - `DB_COOKIE_POOL_SHARDS`
 
 ---
 
@@ -62,7 +45,7 @@
 
 - **网络并发（async）**：`asyncio` + `asyncio.Semaphore(GEN_CONCURRENCY)`
 - **CPU/解析（thread pool）**：`ThreadPoolExecutor(THREAD_POOL_SIZE)` 给 `run_registration_flow` 使用
-- **落盘/入库（单写线程）**：`DataPipeline` 内部用一个 `ThreadPoolExecutor(max_workers=1)` 批量写入 `results*.jsonl`、备份文件、Redis
+- **落盘/入库（单写线程）**：`DataPipeline` 内部用一个 `ThreadPoolExecutor(max_workers=1)` 批量写入 `results*.jsonl`、备份文件、MySQL
 
 同时提供 **keep-alive 会话池**（减少握手/建连）：
 - `MWZZZH_KEEPALIVE=1` 时启用 `SessionPool`
@@ -70,7 +53,7 @@
 - `MWZZZH_SESSION_MAX_REQUESTS` 控制单 session 最大“任务数”，达到后淘汰重建
 
 ### 3.2 可靠性与一致性
-- **Redis 硬失败**：当 `SAVE_TO_REDIS=1`，Redis 连接/写入失败会直接终止，避免“跑了但没入库”
+- **DB 硬失败**：MySQL 连接/写入失败会直接终止，避免“跑了但没入库”
 - **文件备份**：
   - `SAVE_TO_FILE=1` 时写入 `DEVICE_BACKUP_DIR`（默认 `device_backups/`）
   - 分片文件数默认等于线程数（`DEVICE_FILE_SHARDS` 默认 `THREAD_POOL_SIZE`）
@@ -80,7 +63,7 @@
 
 ### 3.3 轮询补齐（Linux 默认）
 `MWZZZH_POLL_MODE=1` 时：
-- 周期性检查每个 device shard 的数量，选择“未满且最少”的池补齐到 `REDIS_MAX_DEVICES`
+- 周期性检查每个 device shard 的数量，选择“未满且最少”的 shard 补齐到 `DB_MAX_DEVICES`
 - 单轮补齐上限：`MWZZZH_POLL_BATCH_MAX`
 
 ---
@@ -88,7 +71,7 @@
 ## 4. 项目 2：Go startUp（`goPlay/demos/signup/dgemail`）
 
 ### 4.1 两种运行方式
-- **一次性模式**：读账号/设备/代理 → 并发注册 → 写结果 → 可选写 Redis cookies
+- **一次性模式**：读设备/代理 → 并发注册 → 写结果 → 写入 MySQL cookies/账号池
 - **轮询补齐模式**（Linux 默认开启）：持续检查 cookies 池缺口，自动注册补齐
 
 ### 4.2 并发模型（注册）
@@ -98,8 +81,8 @@
 
 ### 4.3 轮询补齐（分库）
 补齐模式会：
-- 按 `REDIS_COOKIE_POOL_SHARDS` 扫描各 shard，选择“未满且最少”的 cookies 池写入
-- 目标数量（每个池的最终数量）统一使用 **`REDIS_MAX_COOKIES`**
+- 按 `DB_COOKIE_POOL_SHARDS` 扫描各 shard，选择“未满且最少”的 shard 写入
+- 目标数量（每个 shard 的最终数量）统一使用 **`DB_MAX_COOKIES`**
 
 > 注意：一次性模式里并发数当前是代码固定值；轮询补齐模式会读取 `SIGNUP_CONCURRENCY`。
 
@@ -117,12 +100,12 @@
   - 结果写入使用独立 writer goroutine + 批量 flush，减少磁盘阻塞
 
 ### 5.2 设备与 cookies 的“运行期替换”
-仅在 Redis 模式有效：
-- **设备替换**：连续失败（排除网络错误）达到阈值或播放次数达到阈值时，替换为 Redis 新设备
-- **cookies 替换**：cookies 连续失败达到阈值时自动更换；池为空时回退 `DEFAULT_COOKIES_JSON`
+全 DB 模式下：
+- `dgmain3` 不再做“外部设备池补位”，仅在本次运行内做健康统计并继续轮询
+- cookies 必须来自账号 JSON（device+cookies 同源），不再单独维护 cookies 池替换
 
 ### 5.3 Linux 抢单模式（高并发下的“吞吐优先”路径）
-Linux 下可启用从 MySQL 抢单、Redis 实时记录进度、异常退出时回刷 DB 的流程（避免 `FOR UPDATE`，用乐观更新 + 轮询）。
+Linux 下可启用从 MySQL 抢单、并实时回写 MySQL delivered 的流程（避免 `FOR UPDATE`，用乐观更新 + 轮询）。
 
 ---
 
@@ -141,7 +124,7 @@ Linux 下可启用从 MySQL 抢单、Redis 实时记录进度、异常退出时�
   - CPU：Python 解析线程池不足会导致 event loop 堵塞（表面看并发高，实际吞吐不涨）
   - 内存：过大队列/批量缓冲会吃内存（Go 的 writer 队列、Python 的 pipeline queue）
   - 磁盘：过高写入频率会拖慢主流程；`fsync` 会把吞吐“打穿”
-  - Redis：高频 `HSET/ZINCRBY` 会形成热点 key，影响全局延迟
+  - DB：高频写入会形成热点分片与锁竞争，需要控制写入频率/批量写入
 - **放大重试风暴**：高并发 + 重试（指数退避但仍然重试）会造成“雪崩式”流量峰值
 - **更难定位问题**：日志量暴涨，错误更随机化；需要聚合统计而不是逐条日志
 - **目标达成“超一轮”**：并发任务已启动但尚未完成时达到目标，容易多跑一轮（本仓库已用 `inflight` 缓解）

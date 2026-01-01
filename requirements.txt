@@ -20,8 +20,10 @@ protobuf==6.32.1
 # Progress bar（mwzzzh_spider.py 可选）
 tqdm==4.67.1
 
-# Redis / env
-redis==5.2.0
+# env
 python-dotenv==1.0.1
+
+# MySQL (device pool DB backend for mwzzzh_spider.py)
+PyMySQL==1.1.1
 
 

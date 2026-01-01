@@ -143,7 +143,7 @@ func Stats3(awemeID, seed string, seedType int, token string, device map[string]
 	reqHeaders["tt-device-guard-public-key"] = deviceHeaders["tt-ticket-guard-public-key"]
 	reqHeaders["tt-device-guard-client-data"] = deviceHeaders["tt-device-guard-client-data"]
 
-	// cookies 必须来自 Go startUp 注册写入的 redis cookie 池。
+	// cookies 必须来自 signup 写入的账号 JSON（startup_cookie_accounts.account_json -> cookies 字段）。
 	// 为了兼容老代码，这里允许 cookies 为空（将导致无 cookie 请求，通常会失败）。
 	if cookies == nil {
 		cookies = map[string]string{}

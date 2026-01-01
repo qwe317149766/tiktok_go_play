@@ -12,7 +12,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -688,7 +687,7 @@ type Engine struct {
 	evictedFail  int64
 	evictedPlay  int64
 
-	// Linux 抢单模式：成功回调（每次成功播放触发一次，用于更新 Redis/DB 进度）
+	// Linux 抢单模式：成功回调（每次成功播放触发一次，用于更新 DB 进度）
 	onPlaySuccess func()
 
 	writer        *ResultWriter
@@ -939,67 +938,19 @@ func (e *Engine) snapshotActivePoolIDsLocked() map[string]bool {
 	return out
 }
 
-// replaceBadDeviceIfNeeded：当某个 poolID 连续失败超过阈值时，从 Redis 设备池补一个新设备替换该 slot。
+// replaceBadDeviceIfNeeded：全 DB 模式不做“设备池补位”，只在本次运行内标记不健康并继续轮询。
 func (e *Engine) replaceBadDeviceIfNeeded(slot int, deviceJSON string, poolID string) {
-	// 仅 Redis 设备来源才支持动态补位
-	if !shouldLoadDevicesFromRedis() {
-		return
-	}
-	if e.deviceManager == nil {
-		return
-	}
-	if strings.TrimSpace(poolID) == "" {
-		return
-	}
-	// 连续失败阈值：沿用 DeviceManager 的规则（阈值可配置）
-	if e.deviceManager.IsHealthy(poolID) {
-		return
-	}
-
-	e.replaceDevice(slot, deviceJSON, poolID, "consecutive_fail")
+	return
 }
 
 func (e *Engine) replaceDevice(slot int, deviceJSON string, poolID string, reason string) {
-	// 加锁替换，保证与 nextDevice 互斥
-	e.deviceMutex.Lock()
-	defer e.deviceMutex.Unlock()
-	// slot 可能越界（理论上不会），防御一下
-	if slot < 0 || slot >= len(config.Devices) {
+	if e.deviceManager == nil {
 		return
 	}
-	// 若 slot 已被其它协程替换过，则不重复操作
-	if config.Devices[slot] != deviceJSON {
-		return
-	}
-
-	// 组装 exclude：当前活跃 + banned
-	exclude := e.snapshotActivePoolIDsLocked()
-	e.bannedDeviceMu.RLock()
-	for k := range e.bannedPoolIDs {
-		exclude[k] = true
-	}
-	e.bannedDeviceMu.RUnlock()
-
-	newPoolID, newJSON, err := pickOneDeviceFromRedis(exclude)
-	if err != nil || strings.TrimSpace(newJSON) == "" || strings.TrimSpace(newPoolID) == "" {
-		return
-	}
-
-	// 替换 slot
-	config.Devices[slot] = newJSON
-	// ban 老的 poolID，避免后续再次被补回来
-	e.bannedDeviceMu.Lock()
-	e.bannedPoolIDs[poolID] = true
-	e.bannedDeviceMu.Unlock()
-
-	// 统计：淘汰次数
-	atomic.AddInt64(&e.evictedTotal, 1)
-	switch reason {
-	case "consecutive_fail":
-		atomic.AddInt64(&e.evictedFail, 1)
-	case "play_max":
-		atomic.AddInt64(&e.evictedPlay, 1)
-	}
+	_ = slot
+	_ = deviceJSON
+	_ = poolID
+	_ = reason
 }
 
 // executeTask 执行单个任务 - 优化版本
@@ -1023,7 +974,7 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 		deviceID = fmt.Sprintf("%.0f", id)
 	}
 
-	// Redis 设备池 ID（与 Python 写入的 key 保持一致）
+	// poolID：用于本次运行内的“健康统计”主键
 	poolID := devicePoolIDFromDevice(device)
 
 	// 转换device
@@ -1046,18 +997,12 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 	var seedType int
 	var token string
 
-	// 检查缓存（如果设备来自 Redis，则直接读/写 Redis，确保“缓存更新到 Python 注册设备信息”）
-	if shouldLoadDevicesFromRedis() {
-		if s, st, t, ok := getSeedTokenFromRedis(poolID); ok {
-			seed, seedType, token = s, st, t
-		}
-	} else {
-		cache := GetDeviceCache()
-		if cacheInfo, exists := cache.Get(deviceID); exists {
-			seed = cacheInfo.Seed
-			seedType = cacheInfo.SeedType
-			token = cacheInfo.Token
-		}
+	// 全 DB：seed/token 缓存只用本地 device_cache.txt
+	cache := GetDeviceCache()
+	if cacheInfo, exists := cache.Get(deviceID); exists {
+		seed = cacheInfo.Seed
+		seedType = cacheInfo.SeedType
+		token = cacheInfo.Token
 	}
 
 	if seed == "" || token == "" || seedType == 0 {
@@ -1201,10 +1146,6 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 		}
 
 		if token == "" {
-			// token 获取失败也算一次失败使用
-			if shouldLoadDevicesFromRedis() {
-				_ = incrDeviceFail(poolID, 1)
-			}
 			return false, map[string]interface{}{
 				"stage":     "token",
 				"reason":    "empty token after retries",
@@ -1215,22 +1156,9 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 			}
 		}
 
-		// 保存到缓存（Redis 模式：写回 Python 注册设备信息；文件模式：沿用 device_cache.txt）
-		if shouldLoadDevicesFromRedis() {
-			if err := setSeedTokenToRedis(poolID, seed, seedType, token); err != nil {
-				return false, map[string]interface{}{
-					"stage":     "cache",
-					"reason":    fmt.Sprintf("write seed/token to redis failed: %v", err),
-					"task_id":   taskID,
-					"proxy":     proxy,
-					"device_id": deviceID,
-					"pool_id":   poolID,
-				}
-			}
-		} else {
-			cache := GetDeviceCache()
-			cache.Set(deviceID, seed, seedType, token)
-		}
+		// 保存到缓存：写入本地 device_cache.txt
+		cache := GetDeviceCache()
+		cache.Set(deviceID, seed, seedType, token)
 	}
 
 	// 执行stats请求 - 添加快速重试（最多2次）
@@ -1249,10 +1177,6 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 	var ckID string
 	var ck map[string]string
 	for retry := 0; retry < 2; retry++ {
-		// 尝试次数：每次发起 stats 请求即 +1
-		if shouldLoadDevicesFromRedis() {
-			_ = incrDeviceAttempt(poolID, 1)
-		}
 		// 使用defer recover来捕获panic
 		func() {
 			defer func() {
@@ -1271,9 +1195,6 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 		}
 	}
 	if err != nil {
-		if shouldLoadDevicesFromRedis() {
-			_ = incrDeviceFail(poolID, 1)
-		}
 		// 判断是否是网络错误
 		errStr := err.Error()
 		isNetworkError := strings.Contains(errStr, "connect") ||
@@ -1310,29 +1231,6 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 			cm.RecordSuccess(ckID)
 		} else {
 			cm.RecordFailure(ckID, false)
-		}
-	}
-	// 播放次数：只在成功时 +1
-	if success && shouldLoadDevicesFromRedis() {
-		// 记录 play_count，并返回当前值用于阈值淘汰
-		if pc, err := incrDevicePlayGet(poolID, 1); err == nil {
-			// 返回给上层用于淘汰判断
-			//（注意：map 的 int64 在 JSON 序列化时会变成 number，不影响）
-			result := map[string]interface{}{
-				"stage":      "stats",
-				"raw":        "",
-				"pool_id":    poolID,
-				"device_id":  deviceID,
-				"play_count": pc,
-			}
-			if len(res) > 2000 {
-				result["raw"] = res[:2000]
-			} else {
-				result["raw"] = res
-			}
-			return true, result
-		} else {
-			_ = incrDevicePlay(poolID, 1) // 降级：尽量不影响主流程
 		}
 	}
 	result := map[string]interface{}{
@@ -1376,7 +1274,7 @@ func (e *Engine) taskWrapper(taskID int) {
 
 	atomic.AddInt64(&e.total, 1)
 	deviceID, _ := extra["device_id"].(string)
-	// 用 poolID 做“设备健康/替换”的主键（与 Redis 设备池一致）
+	// 用 poolID 做“设备健康/替换”的主键
 	poolID := extractPoolIDFromDeviceJSON(deviceJSON)
 
 	if ok {
@@ -1393,20 +1291,7 @@ func (e *Engine) taskWrapper(taskID int) {
 			e.onPlaySuccess()
 		}
 		// 方式A（维度2）：成功播放达到阈值就淘汰并补位
-		if shouldLoadDevicesFromRedis() && GetDevicePlayMax() > 0 {
-			if v, ok2 := extra["play_count"]; ok2 {
-				switch t := v.(type) {
-				case int64:
-					if t >= GetDevicePlayMax() {
-						e.replaceDevice(slot, deviceJSON, poolID, "play_max")
-					}
-				case float64:
-					if int64(t) >= GetDevicePlayMax() {
-						e.replaceDevice(slot, deviceJSON, poolID, "play_max")
-					}
-				}
-			}
-		}
+		// 全 DB 模式：不做“达到播放上限即补位”的设备池淘汰（避免依赖外部设备池）。
 		// 成功，不打印日志
 	} else {
 		atomic.AddInt64(&e.failed, 1)
@@ -1666,7 +1551,6 @@ func loadLines(filename string) ([]string, error) {
 func main() {
 	rand.Seed(time.Now().UnixNano())
 	loadEnvForDemo()
-	applyRedisPoolShardFromArgs(os.Args)
 
 	// 确保进度日志在控制台可见（有些环境 stderr 不明显/被上层吞掉）
 	// 默认 log 输出到 stderr；这里强制到 stdout，避免“执行进度没有输出”的观感问题
@@ -1717,19 +1601,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 加载设备：优先从 Python 注册成功写入的 Redis 设备池读取
-	if shouldLoadDevicesFromRedis() {
-		// 可观测性：明确告诉你当前是否在读“startup 注册成功设备池”
-		if shouldLoadDevicesFromStartupRedis() {
-			fmt.Printf("设备来源=startup_redis prefix=%s（来自 REDIS_STARTUP_DEVICE_POOL_KEY；未配置则回退 REDIS_DEVICE_POOL_KEY）\n",
-				strings.TrimSpace(startupDevicePoolPrefix()))
-		}
-		if shouldLoadDevicesFromStartupCookieRedis() {
-			fmt.Printf("设备来源=startup_cookie_redis prefix=%s（来自 REDIS_STARTUP_COOKIE_POOL_KEY；账号池=data 存完整账号JSON）\n",
-				strings.TrimSpace(envStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")))
-		}
-		// Redis 模式：用多少取多少
-		// 默认按并发数取设备（例如并发 1000 就先取 1000 个），设备淘汰时再从 Redis 补位。
+	// 加载设备（账号 JSON 列表）：全 DB 优先
+	if shouldLoadStartupAccountsFromDB() {
 		need := envInt("DEVICES_LIMIT", 0)
 		if need <= 0 {
 			need = config.MaxConcurrency
@@ -1737,32 +1610,22 @@ func main() {
 		if need <= 0 {
 			need = 1
 		}
-		var devs []string
-		var err error
-		if shouldLoadDevicesFromStartupCookieRedis() {
-			// 账号池为空时：按你的要求轮询等待，不要直接退出
-			pollSec := envInt("STATS_ACCOUNT_POLL_INTERVAL_SEC", envInt("STATS_COOKIE_POLL_INTERVAL_SEC", envInt("COOKIES_POLL_INTERVAL_SEC", 10)))
-			if pollSec <= 0 {
-				pollSec = 10
-			}
-			for {
-				devs, err = loadStartupAccountDevicesFromRedisN(need)
-				if err == nil && len(devs) > 0 {
-					break
-				}
-				fmt.Printf("账号池为空/无有效账号（REDIS_STARTUP_COOKIE_POOL_KEY=%s），将每 %d 秒轮询等待补齐...\n",
-					strings.TrimSpace(envStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")), pollSec)
-				time.Sleep(time.Duration(pollSec) * time.Second)
-			}
-		} else {
-			devs, err = loadDevicesFromRedisN(need)
+		pollSec := envInt("STATS_ACCOUNT_POLL_INTERVAL_SEC", envInt("STATS_COOKIE_POLL_INTERVAL_SEC", envInt("COOKIES_POLL_INTERVAL_SEC", 10)))
+		if pollSec <= 0 {
+			pollSec = 10
 		}
-		if err != nil {
-			fmt.Printf("从Redis读取设备失败: %v\n", err)
-			os.Exit(1)
+		fmt.Printf("设备来源=db table=%s（账号池 account_json 含 cookies；device+cookies 同源）\n", dbCookiePoolTable())
+		for {
+			devs, err := loadStartupAccountsFromDBN(need)
+			if err == nil && len(devs) > 0 {
+				config.Devices = append(config.Devices, devs...)
+				break
+			}
+			fmt.Printf("账号池为空/无有效账号（DB_COOKIE_POOL_TABLE=%s），将每 %d 秒轮询等待补齐...\n",
+				dbCookiePoolTable(), pollSec)
+			time.Sleep(time.Duration(pollSec) * time.Second)
 		}
-		config.Devices = append(config.Devices, devs...)
-		fmt.Printf("已从Redis加载 %d 个设备（按需加载，目标=%d）\n", len(config.Devices), need)
+		fmt.Printf("已从MySQL加载 %d 条账号JSON（目标=%d）\n", len(config.Devices), need)
 	} else {
 		// 兼容旧逻辑：读本地文件（如果不存在则自动生成）
 		if data, err := ioutil.ReadFile(devicesPath); err == nil {
@@ -1812,14 +1675,62 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 加载 cookies：必须来自 Go startUp 注册写入的 Redis cookie 池
-	// 你要求：stats 的 cookies 和 设备必须来自同一个 JSON（账号池里每条完整账号 JSON 含 cookies 字段）。
-	// 当设备来源是 startup_cookie_redis 时，强制从 config.Devices（即账号 JSON 列表）抽取 cookies，保证同源。
-	if shouldLoadDevicesFromStartupCookieRedis() {
+	// 加载 cookies：支持多种来源（默认/数据库/设备文件）
+	// 优先级：如果配置了 DEFAULT_COOKIES_JSON，优先使用（即使没有设置 COOKIES_SOURCE=default）
+	rawDefaultCookies := strings.TrimSpace(os.Getenv("DEFAULT_COOKIES_JSON"))
+	if rawDefaultCookies != "" {
+		// 如果配置了 DEFAULT_COOKIES_JSON，优先使用默认 cookies
+		rec, ok, err := defaultCookieFromEnv()
+		if err != nil {
+			fmt.Printf("加载默认 cookies 失败：%v\n", err)
+			fmt.Printf("提示：请检查 DEFAULT_COOKIES_JSON 是否为有效的 JSON 格式\n")
+			os.Exit(1)
+		}
+		if !ok {
+			fmt.Printf("cookies 来源=default 但 DEFAULT_COOKIES_JSON 解析后为空\n")
+			os.Exit(1)
+		}
+		globalCookiePool = []CookieRecord{rec}
+		fmt.Printf("已加载默认 cookies（来源=DEFAULT_COOKIES_JSON，包含 %d 个 cookie 字段）\n", len(rec.Cookies))
+	} else if shouldLoadCookiesFromDefault() {
+		// 如果设置了 COOKIES_SOURCE=default 但 DEFAULT_COOKIES_JSON 为空，报错
+		fmt.Printf("cookies 来源=default 但 DEFAULT_COOKIES_JSON 未配置或为空\n")
+		os.Exit(1)
+	} else if shouldLoadCookiesFromDB() {
+		// 从数据库独立加载 cookies（不依赖设备）
+		limit := envInt("COOKIES_LIMIT", 0)
+		if limit <= 0 {
+			limit = config.MaxConcurrency
+		}
+		if limit <= 0 {
+			limit = 100
+		}
+		pollSec := envInt("STATS_ACCOUNT_POLL_INTERVAL_SEC", envInt("STATS_COOKIE_POLL_INTERVAL_SEC", envInt("COOKIES_POLL_INTERVAL_SEC", 10)))
+		if pollSec <= 0 {
+			pollSec = 10
+		}
+		fmt.Printf("cookies 来源=db table=%s（从账号池独立加载 cookies）\n", dbCookiePoolTable())
+		var cookies []CookieRecord
+		for {
+			accounts, err := loadStartupAccountsFromDBN(limit)
+			if err == nil && len(accounts) > 0 {
+				cookies = loadCookiesFromStartupDevices(accounts, limit)
+				if len(cookies) > 0 {
+					break
+				}
+			}
+			fmt.Printf("cookies 池为空/无有效 cookies（DB_COOKIE_POOL_TABLE=%s），将每 %d 秒轮询等待补齐...\n",
+				dbCookiePoolTable(), pollSec)
+			time.Sleep(time.Duration(pollSec) * time.Second)
+		}
+		globalCookiePool = cookies
+		fmt.Printf("已从MySQL cookies 池加载 %d 份 cookies（目标=%d）\n", len(globalCookiePool), limit)
+	} else if shouldLoadStartupAccountsFromDB() {
+		// 从设备同源的账号 JSON 提取 cookies（设备+cookies 同源）
 		limit := envInt("COOKIES_LIMIT", 0)
 		cookies := loadCookiesFromStartupDevices(config.Devices, limit)
 		if len(cookies) == 0 {
-			fmt.Printf("从账号池设备列表提取 cookies 失败：请确认 startup_cookie_pool:data 存的是完整账号 JSON 且包含 cookies 字段\n")
+			fmt.Printf("从账号池账号JSON提取 cookies 失败：请确认 MySQL %s.account_json 存的是完整账号 JSON 且包含 cookies 字段\n", dbCookiePoolTable())
 			os.Exit(1)
 		}
 		globalCookiePool = cookies
@@ -1828,7 +1739,7 @@ func main() {
 		limit := envInt("COOKIES_LIMIT", 0)
 		// 从“设备列表”抽取 cookies：config.Devices 每行 JSON（包含 cookies 字段）
 		// - 如果 DEVICES_SOURCE=file，则来自设备文件（如 startUp 导出的 devices12_21_3.txt）
-		// - 如果 DEVICES_SOURCE=redis，则来自 Redis 设备池（需确保每条设备 JSON 也包含 cookies 字段）
+		// - 如果 DEVICES_SOURCE=file，则来自设备文件（需确保每条设备 JSON 也包含 cookies 字段）
 		cookies := loadCookiesFromStartupDevices(config.Devices, limit)
 		if len(cookies) == 0 {
 			fmt.Printf("从设备文件提取 cookies 失败：请确认设备文件每行包含 cookies 字段（如 {'k':'v'}），并检查 create_time 过滤是否过严\n")
@@ -1837,11 +1748,11 @@ func main() {
 		globalCookiePool = cookies
 		fmt.Printf("已从设备列表抽取 %d 份 cookies（来自每行 cookies 字段）\n", len(globalCookiePool))
 	} else {
-		fmt.Printf("cookies 未配置：请使用 DEVICES_SOURCE=startup_cookie_redis（推荐）或 COOKIES_SOURCE=devices_file，从 signup 产出的账号 JSON 里解析 cookies\n")
+		fmt.Printf("cookies 未配置：请设置 COOKIES_SOURCE=default（使用 DEFAULT_COOKIES_JSON）或 COOKIES_SOURCE=db（从数据库加载）或 DEVICES_SOURCE=db（与设备同源）或 COOKIES_SOURCE=devices_file（从设备文件提取）\n")
 		os.Exit(1)
 	}
 
-	// Linux 抢单模式：从数据库抢未完成订单，按订单 aweme_id 执行播放，并实时写 Redis/回写数据库
+	// Linux 抢单模式：从数据库抢未完成订单，按订单 aweme_id 执行播放，并回写数据库
 	if shouldRunOrderMode() {
 		runOrderMode()
 		return
@@ -1860,71 +1771,7 @@ func main() {
 	// 总耗时已在Run()方法中打印
 }
 
-// applyRedisPoolShardFromArgs 支持按脚本参数切换 Redis 设备池/ cookies 池：
-// - go run . 1 1  => 使用 tiktok:device_pool:1 与 tiktok:startup_cookie_pool:1
-// - 不传参       => 默认 0 号（不加后缀，保持 tiktok:device_pool / tiktok:startup_cookie_pool）
-//
-// “库数量”可通过配置限制：
-// - REDIS_DEVICE_POOL_SHARDS（默认 1）
-// - REDIS_COOKIE_POOL_SHARDS（默认 1）
-func applyRedisPoolShardFromArgs(args []string) {
-	deviceIdx := 0
-	cookieIdx := 0
-	if len(args) >= 2 {
-		if n, err := strconv.Atoi(strings.TrimSpace(args[1])); err == nil && n >= 0 {
-			deviceIdx = n
-		}
-	}
-	// 只传一个 idx：默认按“cookie 分库”理解（device 默认不分库）
-	if len(args) < 3 {
-		cookieIdx = deviceIdx
-		deviceIdx = 0
-	} else if len(args) >= 3 {
-		if n, err := strconv.Atoi(strings.TrimSpace(args[2])); err == nil && n >= 0 {
-			cookieIdx = n
-		}
-	}
-
-	devShards := envInt("REDIS_DEVICE_POOL_SHARDS", 1)
-	ckShards := envInt("REDIS_COOKIE_POOL_SHARDS", 1)
-	if devShards <= 0 {
-		devShards = 1
-	}
-	if ckShards <= 0 {
-		ckShards = 1
-	}
-	// device 池默认不分库：如果没有配置 device shards（或=1），则忽略 deviceIdx
-	if devShards <= 1 {
-		deviceIdx = 0
-	}
-	if deviceIdx >= devShards {
-		log.Printf("[pool] devicePoolIdx=%d 超出 REDIS_DEVICE_POOL_SHARDS=%d，自动回退为 0", deviceIdx, devShards)
-		deviceIdx = 0
-	}
-	if cookieIdx >= ckShards {
-		log.Printf("[pool] cookiePoolIdx=%d 超出 REDIS_COOKIE_POOL_SHARDS=%d，自动回退为 0", cookieIdx, ckShards)
-		cookieIdx = 0
-	}
-
-	baseDev := envStr("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool")
-	baseCk := envStr("REDIS_STARTUP_COOKIE_POOL_KEY", "tiktok:startup_cookie_pool")
-
-	devKey := baseDev
-	if deviceIdx > 0 {
-		devKey = fmt.Sprintf("%s:%d", baseDev, deviceIdx)
-	}
-	ckKey := baseCk
-	if cookieIdx > 0 {
-		ckKey = fmt.Sprintf("%s:%d", baseCk, cookieIdx)
-	}
-
-	// 覆盖进程内 env：后续所有 Redis 读写都将使用该前缀
-	_ = os.Setenv("REDIS_DEVICE_POOL_KEY", devKey)
-	_ = os.Setenv("REDIS_STARTUP_COOKIE_POOL_KEY", ckKey)
-
-	log.Printf("[pool] selected devicePoolIdx=%d/%d key=%s | cookiePoolIdx=%d/%d key=%s",
-		deviceIdx, devShards, devKey, cookieIdx, ckShards, ckKey)
-}
+// 分片：全 DB 模式使用 MySQL 表的 shard_id 字段分片。
 
 // findTopmostFileUpwards 从当前目录开始向上查找文件，返回“最顶层”的那个路径（更接近仓库根目录）。
 func findTopmostFileUpwards(name string, maxUp int) string {

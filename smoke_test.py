@@ -16,7 +16,7 @@ def run(cmd: list[str], cwd: Path | None = None) -> None:
 
 def main() -> None:
     # 1) Python 依赖与脚本自检（生成设备脚本）
-    #    不连 Redis，避免测试环境没有 Redis 导致失败；只验证能生成+写文件
+    #    全 DB 模式：只验证能生成+写文件
     out_dir = ROOT / "smoke_device_backups"
     out_dir.mkdir(exist_ok=True)
 
@@ -24,7 +24,6 @@ def main() -> None:
         [
             sys.executable,
             "generate_devices_bulk.py",
-            "--no-save-redis",
             "--save-file",
             "--max-generate",
             "50",
@@ -42,7 +41,7 @@ def main() -> None:
     # 2) Python 注册主流程导入自检（不实际跑网络任务）
     run([sys.executable, "-c", "import mwzzzh_spider; print('mwzzzh_spider import ok')"])
 
-    # 3) Go stats 项目编译自检（确保 Redis/计数改动后可构建）
+    # 3) Go stats 项目编译自检（确保全 DB 改动后可构建）
     go_mod_dir = ROOT / "goPlay"
     run(["go", "test", "./demos/stats/dgmain3", "-c"], cwd=go_mod_dir)
 

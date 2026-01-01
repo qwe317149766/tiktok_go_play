@@ -10,10 +10,8 @@
 - **核心接口**：`POST /api`（`application/x-www-form-urlencoded`）
 - **鉴权**：每次请求都必须携带 `key`（API Key）
   - API Key **来源 MySQL 表**：`api_keys`
-  - API Key **永久缓存**：Redis Hash（优先从 Redis 校验）
-    - key：`REDIS_API_KEYS_KEY`（默认：`tiktok:api_keys`）
-    - field：`api_key`
-    - value：`api_keys` 表对应行的 JSON
+  - API Key **缓存**：进程内 TTL cache（优先从 cache 校验；miss 回源 DB）
+    - TTL：`API_KEY_CACHE_TTL_SEC`（默认 30 秒）
 
 ---
 
@@ -47,7 +45,7 @@
 
 | 参数名 | 类型 | 必填 | 示例 | 说明 |
 |---|---|---:|---|---|
-| `key` | string | ✅ | `YOUR_KEY` | API Key（从 DB/Redis 校验，必须存在且启用） |
+| `key` | string | ✅ | `YOUR_KEY` | API Key（从 DB 校验，必须存在且启用；服务端会做进程内 TTL cache） |
 | `action` | string | ✅ | `add` / `status` | 动作 |
 | `service` | string/int | ❌ | `1` | 保留字段：当前实现不使用 |
 
@@ -56,9 +54,9 @@
 | HTTP | body | 触发条件 |
 |---:|---|---|
 | 401 | `{"error":"missing key"}` | 未传 `key` |
-| 401 | `{"error":"invalid key"}` | `key` 在 DB 不存在（或 Redis miss 后 DB 也不存在） |
+| 401 | `{"error":"invalid key"}` | `key` 在 DB 不存在 |
 | 401 | `{"error":"key disabled"}` | `api_keys.is_active=0` |
-| 500 | `{"error":"auth error"}` | 校验 key 时 DB/Redis 异常（如 Redis 连接断开等） |
+| 500 | `{"error":"auth error"}` | 校验 key 时 DB 异常 |
 | 400 | `{"error":"invalid action"}` | action 不是 `add/status` |
 
 > 说明：本服务对每个 API 请求都会校验 `key`，并且 status 查询还会做 **订单归属校验**（只能查自己 key 创建的订单）。
@@ -87,7 +85,7 @@
    - 校验 `credit >= quantity`
    - `UPDATE api_keys SET credit = credit - quantity`
 4. `INSERT INTO orders(...)`
-5. 成功后刷新 Redis 中该 key 的缓存（避免 credit 缓存过期）
+5. 成功后刷新服务端进程内 cache（避免缓存变脏）
 
 #### 成功响应
 - **200**
@@ -215,7 +213,7 @@ curl -X POST "http://127.0.0.1:8080/api" \
 ### 3.2 `POST /admin/api_keys/add`
 
 #### 说明
-该接口用于**创建或更新** `api_keys` 表记录（并写入 Redis 永久缓存）。
+该接口用于**创建或更新** `api_keys` 表记录（并刷新服务端进程内 cache）。
 
 #### 请求参数（表单）
 
@@ -242,8 +240,8 @@ curl -X POST "http://127.0.0.1:8080/api" \
   - `total_credit += credit_delta`
   - `merchant_name`：仅当本次传入非空时更新
 
-#### 写 Redis（永久缓存）
-- 写入：`HSET {REDIS_API_KEYS_KEY} {api_key} <json>`（永久，不设置 TTL）
+#### 缓存刷新
+- 服务端会刷新进程内 cache（TTL 缓存），不需要额外中间件。
 
 #### 成功响应
 - **200**
@@ -269,7 +267,7 @@ curl -X POST "http://127.0.0.1:8080/admin/api_keys/add" \
 
 ---
 
-## 4. 数据结构（DB/Redis）
+## 4. 数据结构（DB）
 
 ### 4.1 MySQL：`api_keys`
 字段含义见 `api_server/schema.sql`，核心字段：
@@ -283,10 +281,8 @@ curl -X POST "http://127.0.0.1:8080/admin/api_keys/add" \
 - `api_key`：订单归属（status 会按此做权限隔离）
 - `quantity/delivered/start_count/status`
 
-### 4.3 Redis：API Key 永久缓存
-- 结构：Hash
-- key：`REDIS_API_KEYS_KEY`（默认 `tiktok:api_keys`）
-- field：`api_key`
-- value：`APIKeyRow` 的 JSON（包含 merchant_name / credit / total_credit / is_active 等）
+### 4.3 API Key 缓存（进程内 TTL）
+- 用途：加速每次请求校验 key（跨进程不共享）
+- TTL：`API_KEY_CACHE_TTL_SEC`
 
 

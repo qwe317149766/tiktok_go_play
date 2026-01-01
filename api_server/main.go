@@ -29,10 +29,10 @@ func main() {
 		}
 	}
 
-	// api_key 永久缓存（redis）
+	// api_key 缓存（全 DB：进程内 TTL cache）
 	cache, err := newAPIKeyCache()
 	if err != nil {
-		log.Fatalf("redis connect failed: %v", err)
+		log.Fatalf("cache init failed: %v", err)
 	}
 	defer cache.Close()
 

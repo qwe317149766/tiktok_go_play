@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import json
+import hashlib
 import os
 import random
 import traceback
@@ -166,200 +167,156 @@ def _auto_thread_pool_size() -> int:
 
 
 @dataclass(frozen=True)
-class RedisConfig:
-    url: str | None
+class MySQLConfig:
     host: str
     port: int
-    db: int
-    username: str | None
-    password: str | None
-    ssl: bool
-    key_prefix: str
+    user: str
+    password: str
+    db: str
+    table: str
     id_field: str
-    max_size: int
-    evict_policy: str  # play/use/attempt
+    shards: int
+    force_shard: int | None
 
 
-def _get_redis_config(max_devices_default: int) -> RedisConfig:
-    url = os.getenv("REDIS_URL") or None
-    host = os.getenv("REDIS_HOST", "127.0.0.1")
-    port = int(os.getenv("REDIS_PORT", "6379"))
-    db = int(os.getenv("REDIS_DB", "0"))
-    username = os.getenv("REDIS_USERNAME") or None
-    password = os.getenv("REDIS_PASSWORD") or None
-    ssl = _parse_bool(os.getenv("REDIS_SSL"), False)
-    # Python 设备池：按你的要求“固定不分库”
-    # 即便环境变量误配为 "tiktok:device_pool:<idx>"，这里也会自动去掉后缀
-    key_prefix = _normalize_pool_base(os.getenv("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool"))
-    id_field = os.getenv("REDIS_DEVICE_ID_FIELD", "cdid")
-    max_size = int(os.getenv("REDIS_MAX_DEVICES", str(max_devices_default)))
-    evict_policy = (os.getenv("REDIS_EVICT_POLICY", "play") or "play").strip().lower()
-    return RedisConfig(
-        url=url,
+def _get_mysql_config() -> MySQLConfig:
+    # 复用 env.linux / env.windows 的 DB_*（stats 抢单模式也在用）
+    host = os.getenv("DB_HOST", "127.0.0.1")
+    port = int(os.getenv("DB_PORT", "3306"))
+    user = os.getenv("DB_USER", "root")
+    password = os.getenv("DB_PASSWORD", "123456")
+    db = os.getenv("DB_NAME", "tiktok_go_play")
+
+    table = (os.getenv("DB_DEVICE_POOL_TABLE") or "device_pool_devices").strip() or "device_pool_devices"
+    # 设备唯一字段：默认 device_id（可覆盖）
+    id_field = (os.getenv("DEVICE_ID_FIELD") or "device_id").strip() or "device_id"
+
+    shards = int(os.getenv("DB_DEVICE_POOL_SHARDS", "1"))
+    if shards <= 0:
+        shards = 1
+    force_shard_raw = (os.getenv("MWZZZH_DB_DEVICE_SHARD") or "").strip()
+    force_shard: int | None = None
+    if force_shard_raw:
+        try:
+            force_shard = int(force_shard_raw)
+        except Exception:
+            force_shard = None
+
+    return MySQLConfig(
         host=host,
         port=port,
-        db=db,
-        username=username,
+        user=user,
         password=password,
-        ssl=ssl,
-        key_prefix=key_prefix,
+        db=db,
+        table=table,
         id_field=id_field,
-        max_size=max_size,
-        evict_policy=evict_policy,
+        shards=shards,
+        force_shard=force_shard,
     )
 
 
-class RedisDevicePool:
+def _stable_shard(device_id: str, shards: int) -> int:
+    if shards <= 1:
+        return 0
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return 0
+    h = hashlib.sha1(device_id.encode("utf-8", errors="ignore")).hexdigest()
+    return int(h[:8], 16) % shards
+
+
+class MySQLDevicePool:
     """
-    Redis 设备池：注册成功设备写入这里，供后续 Go/其它模块消费
+    MySQL 设备池：注册成功设备写入 MySQL，替代 Redis device_pool。
 
-    Key 结构（全部基于 key_prefix）：
-    - {prefix}:ids   (SET)  所有设备 id
-    - {prefix}:data  (HASH) id -> device_json
-    - {prefix}:use   (ZSET) id -> use_count
-    - {prefix}:fail  (ZSET) id -> fail_count
-    - {prefix}:seq   (STRING/INT) 自增序号（严格 FIFO 用）
-    - {prefix}:in    (ZSET) id -> seq（入队顺序，越小越早入队）
-
-    超限淘汰：use_count 最大的先淘汰（最常用的淘汰）
+    表结构见：api_server/schema.sql -> device_pool_devices
     """
 
-    def __init__(self, cfg: RedisConfig):
+    def __init__(self, cfg: MySQLConfig):
         self.cfg = cfg
-        self.ids_key = f"{cfg.key_prefix}:ids"
-        self.data_key = f"{cfg.key_prefix}:data"
-        self.use_key = f"{cfg.key_prefix}:use"
-        self.fail_key = f"{cfg.key_prefix}:fail"
-        # 计数：Go stats 会写 play/attempt；Python 写入时也初始化为 0，方便后续淘汰
-        self.play_key = f"{cfg.key_prefix}:play"
-        self.attempt_key = f"{cfg.key_prefix}:attempt"
-        # FIFO 队列：严格按入队顺序优先取（Go stats 读取时用）
-        self.seq_key = f"{cfg.key_prefix}:seq"
-        self.in_key = f"{cfg.key_prefix}:in"
-
         try:
-            import redis  # type: ignore
+            import pymysql  # type: ignore
         except Exception as e:
-            raise RuntimeError("缺少依赖：redis，请先 pip install -r requirements.txt") from e
+            raise RuntimeError("缺少依赖：PyMySQL，请先 pip install -r requirements.txt") from e
+        self._pymysql = pymysql
+        self._conn = None
 
-        if cfg.url:
-            self.r = redis.Redis.from_url(cfg.url, decode_responses=True)
-        else:
-            self.r = redis.Redis(
-                host=cfg.host,
-                port=cfg.port,
-                db=cfg.db,
-                username=cfg.username,
-                password=cfg.password,
-                ssl=cfg.ssl,
-                decode_responses=True,
-            )
+    def _conn_open(self):
+        if self._conn is not None:
+            return self._conn
+        self._conn = self._pymysql.connect(
+            host=self.cfg.host,
+            port=int(self.cfg.port),
+            user=self.cfg.user,
+            password=self.cfg.password,
+            database=self.cfg.db,
+            charset="utf8mb4",
+            autocommit=True,
+        )
+        return self._conn
 
     def ping(self) -> None:
-        self.r.ping()
+        c = self._conn_open()
+        with c.cursor() as cur:
+            cur.execute("SELECT 1")
+            _ = cur.fetchone()
 
     def count(self) -> int:
-        return int(self.r.scard(self.ids_key))
+        c = self._conn_open()
+        table = self.cfg.table
+        with c.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM `{table}`")
+            row = cur.fetchone()
+        try:
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
+
+    def count_shard(self, shard_id: int) -> int:
+        c = self._conn_open()
+        table = self.cfg.table
+        shard_id = int(shard_id) % int(self.cfg.shards or 1)
+        with c.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM `{table}` WHERE shard_id=%s", (shard_id,))
+            row = cur.fetchone()
+        try:
+            return int(row[0]) if row else 0
+        except Exception:
+            return 0
 
     def _extract_id(self, device: Dict[str, Any]) -> str:
         raw = device.get(self.cfg.id_field)
         if isinstance(raw, str) and raw.strip():
             return raw.strip()
-        # fallback：尽量找稳定字段
         for k in ("cdid", "clientudid", "openudid", "device_id", "install_id"):
             v = device.get(k)
             if isinstance(v, str) and v.strip():
                 return v.strip()
-        # 最后兜底
         return f"anon:{time.time_ns()}"
 
-    def add_devices(self, devices: list[Dict[str, Any]]) -> tuple[int, int]:
-        """
-        批量写入：
-        - 新设备：初始化 use=0, fail=0
-        - 旧设备：更新 data，不重置计数
-        返回：(写入数量, 淘汰数量)
-        """
-        # 可观测性：写入前后池子数量变化（用于排查“注册成功但缺口不变”）
-        try:
-            before = int(self.r.scard(self.ids_key))
-        except Exception:
-            before = -1
-
-        write_n = 0
+    def add_devices(self, devices: list[Dict[str, Any]]) -> int:
+        if not devices:
+            return 0
+        c = self._conn_open()
+        table = self.cfg.table
+        rows = []
         for dev in devices:
-            dev_id = self._extract_id(dev)
-            dev_json = json.dumps(dev, ensure_ascii=False, separators=(",", ":"))
+            did = self._extract_id(dev)
+            if self.cfg.force_shard is not None:
+                shard = int(self.cfg.force_shard) % int(self.cfg.shards or 1)
+            else:
+                shard = _stable_shard(did, int(self.cfg.shards))
+            raw = json.dumps(dev, ensure_ascii=False, separators=(",", ":"))
+            rows.append((shard, did, raw))
 
-            # existed?
-            existed = bool(self.r.sismember(self.ids_key, dev_id))
-            pipe = self.r.pipeline(transaction=True)
-            pipe.sadd(self.ids_key, dev_id)
-            pipe.hset(self.data_key, dev_id, dev_json)
-            if not existed:
-                # 严格 FIFO：用自增 seq 作为 score（避免时间戳同秒导致顺序不稳定）
-                try:
-                    seq = int(self.r.incr(self.seq_key))
-                except Exception:
-                    # 回退：毫秒时间戳（非严格但可用）
-                    seq = int(time.time() * 1000)
-                pipe.zadd(self.in_key, {dev_id: seq})
-                pipe.zadd(self.use_key, {dev_id: 0})
-                pipe.zadd(self.fail_key, {dev_id: 0})
-                pipe.zadd(self.play_key, {dev_id: 0})
-                pipe.zadd(self.attempt_key, {dev_id: 0})
-            pipe.execute()
-            write_n += 1
-
-        evicted = self.evict_if_needed()
-        try:
-            after = int(self.r.scard(self.ids_key))
-        except Exception:
-            after = -1
-
-        if before >= 0 and after >= 0:
-            delta = after - before
-            # delta==0 常见原因：全部重复 id（SET 去重）或写入后被并发消费/淘汰抵消
-            logger.info(
-                f"[redis] batch_done key={self.cfg.key_prefix} id_field={self.cfg.id_field} "
-                f"batch={len(devices)} wrote={write_n} before={before} after={after} delta={delta} evicted={evicted}"
-            )
-        return write_n, evicted
-
-    def evict_if_needed(self) -> int:
-        max_size = max(0, int(self.cfg.max_size))
-        if max_size <= 0:
-            return 0
-        cur = int(self.r.scard(self.ids_key))
-        if cur <= max_size:
-            return 0
-        excess = cur - max_size
-        # 淘汰策略：优先按播放次数(play)最大淘汰；如果 play 为空则回退 use（历史兼容）。
-        policy = (self.cfg.evict_policy or "play").lower()
-        if policy not in {"play", "use", "attempt"}:
-            policy = "play"
-        zkey = self.play_key if policy == "play" else (self.attempt_key if policy == "attempt" else self.use_key)
-        # 若选择 play/attempt 但没有任何成员，则回退到 use
-        try:
-            if zkey != self.use_key and int(self.r.zcard(zkey)) == 0:
-                zkey = self.use_key
-        except Exception:
-            zkey = self.use_key
-
-        ids = self.r.zrevrange(zkey, 0, excess - 1)
-        if not ids:
-            return 0
-        pipe = self.r.pipeline(transaction=True)
-        for dev_id in ids:
-            pipe.srem(self.ids_key, dev_id)
-            pipe.hdel(self.data_key, dev_id)
-            pipe.zrem(self.in_key, dev_id)
-            pipe.zrem(self.use_key, dev_id)
-            pipe.zrem(self.fail_key, dev_id)
-            pipe.zrem(self.play_key, dev_id)
-            pipe.zrem(self.attempt_key, dev_id)
-        pipe.execute()
-        return len(ids)
+        sql = (
+            f"INSERT INTO `{table}` (shard_id, device_id, device_json) "
+            f"VALUES (%s,%s,%s) "
+            f"ON DUPLICATE KEY UPDATE device_json=VALUES(device_json), updated_at=CURRENT_TIMESTAMP"
+        )
+        with c.cursor() as cur:
+            cur.executemany(sql, rows)
+        return len(rows)
 
 
 # ================= 1. 配置区域 =================
@@ -389,12 +346,13 @@ class Config:
     # - 如果你不需要 results 文件，设置 MWZZZH_SAVE_RESULTS_FILE=0 可避免打开该文件
     SAVE_RESULTS_FILE = _parse_bool(os.getenv("MWZZZH_SAVE_RESULTS_FILE"), True)
     # results 写入失败是否视为致命错误：
-    # - 默认 False：results 只是辅助日志，不应影响 Redis 入库
+    # - 默认 False：results 只是辅助日志，不应影响入库
     # - 如需强一致（results 必须落盘），可设置 MWZZZH_RESULTS_FATAL=1
     RESULTS_FATAL = _parse_bool(os.getenv("MWZZZH_RESULTS_FATAL"), False)
 
-    # 是否保存“注册成功设备”到 Redis
-    SAVE_TO_REDIS = _parse_bool(os.getenv("SAVE_TO_REDIS"), False)
+    # 设备池后端：
+    # - db/mysql：写入 MySQL（全系统唯一来源）
+    DEVICE_POOL_BACKEND = (os.getenv("DEVICE_POOL_BACKEND") or "db").strip().lower()
 
     # 是否把“注册成功设备”写入本地备份文件（10 个文件，均分；追加写入）
     # 复用你已有的 SAVE_TO_FILE / PER_FILE_MAX 配置（与 generate_devices_bulk.py 一致）
@@ -416,24 +374,24 @@ class Config:
     # - 再否则默认 1000
     TASKS = _get_int_from_env("MWZZZH_TASKS", "MAX_GENERATE", default=1000)
 
-    # Linux 轮询补齐模式（设备池补齐）：
-    # - Linux 默认开启；Windows 默认关闭（可用 MWZZZH_POLL_MODE=1 强制开启调试）
-    # - 轮询时，会检查 Redis 设备池当前数量，若少于目标数量，则自动补齐缺口
+    # 轮询补齐模式（设备池补齐，run-once 友好，建议配合 cron）
     POLL_MODE = _parse_bool(
         os.getenv("MWZZZH_POLL_MODE"),
-        default=("linux" in platform.system().lower()),
+        default=False,
     )
     # 轮询间隔（秒）
     POLL_INTERVAL_SEC = _get_int_from_env("MWZZZH_POLL_INTERVAL_SEC", default=10)
-    # 设备池最终目标数量：统一使用 REDIS_MAX_DEVICES（作为“池子最终数量/容量”）
-    # - REDIS_TARGET_DEVICES 已废弃（若配置了会被忽略），避免与 REDIS_MAX_DEVICES 冲突
-    REDIS_MAX_DEVICES = _get_int_from_env("REDIS_MAX_DEVICES", default=TASKS)
+    # 每个 shard 的目标数量：统一使用 DB_MAX_DEVICES（作为“池子最终数量/容量”）
+    DB_MAX_DEVICES = _get_int_from_env("DB_MAX_DEVICES", default=TASKS)
     # 单轮补齐最大注册数量（避免一次补太多）
     POLL_BATCH_MAX = _get_int_from_env("MWZZZH_POLL_BATCH_MAX", default=TASKS)
-    # Redis 设备池分库数量（用于平均分配/多实例并行消费）
-    # - 1：不分库（所有设备写入同一个 tiktok:device_pool）
-    # - N：分库（0号池为 base；i号池为 base:{i}）
-    DEVICE_POOL_SHARDS = _get_int_from_env("REDIS_DEVICE_POOL_SHARDS", default=1)
+    # 设备池分片数量：对应 device_pool_devices.shard_id
+    DEVICE_POOL_SHARDS = _get_int_from_env("DB_DEVICE_POOL_SHARDS", default=1)
+
+    # run-once：补齐后退出（适合 cron）
+    POLL_ONCE = _parse_bool(os.getenv("MWZZZH_POLL_ONCE"), True)
+    # 单次 run 最大补齐总量（0=不限制）
+    POLL_MAX_TOTAL = _get_int_from_env("MWZZZH_POLL_MAX_TOTAL", default=0)
 
     # keep-alive / Session 复用（连接复用 + 达到最大请求数自动淘汰重建）
     # - 默认开启（提升性能，减少握手/建连）
@@ -458,18 +416,21 @@ fh.setLevel(logging.ERROR)
 fh.setFormatter(formatter)
 logger.addHandler(fh)
 
-# 启动可观测性：告诉你 env 是否加载成功、是否会写 Redis
+# 启动可观测性：告诉你 env 是否加载成功、是否会写 DB
 try:
     logger.info(
-        "[env] loaded=%s | SAVE_TO_REDIS=%s | REDIS_DEVICE_POOL_KEY=%s | REDIS_DB=%s | REDIS_URL=%s | REDIS_HOST=%s | REDIS_PORT=%s | REDIS_SSL=%s",
+        "[env] loaded=%s",
         _MWZZZH_ENV_FILE,
-        os.getenv("SAVE_TO_REDIS"),
-        os.getenv("REDIS_DEVICE_POOL_KEY"),
-        os.getenv("REDIS_DB"),
-        os.getenv("REDIS_URL"),
-        os.getenv("REDIS_HOST"),
-        os.getenv("REDIS_PORT"),
-        os.getenv("REDIS_SSL"),
+    )
+    logger.info(
+        "[env] DEVICE_POOL_BACKEND=%s | DB_HOST=%s | DB_PORT=%s | DB_NAME=%s | DB_DEVICE_POOL_TABLE=%s | DB_DEVICE_POOL_SHARDS=%s | DEVICE_ID_FIELD=%s",
+        os.getenv("DEVICE_POOL_BACKEND"),
+        os.getenv("DB_HOST"),
+        os.getenv("DB_PORT"),
+        os.getenv("DB_NAME"),
+        os.getenv("DB_DEVICE_POOL_TABLE"),
+        os.getenv("DB_DEVICE_POOL_SHARDS"),
+        os.getenv("DEVICE_ID_FIELD") or "device_id",
     )
 except Exception:
     pass
@@ -477,13 +438,19 @@ except Exception:
 
 # ================= 3. 数据管道 (保持不变) =================
 class DataPipeline:
-    def __init__(self, filename, redis_pool: RedisDevicePool | None = None, save_to_file: bool = False, save_results_file: bool = True):
+    def __init__(
+        self,
+        filename,
+        db_pool: MySQLDevicePool | None = None,
+        save_to_file: bool = False,
+        save_results_file: bool = True,
+    ):
         self.filename = filename
         self.queue = asyncio.Queue()
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.running = True
         self._writer_task = None
-        self.redis_pool = redis_pool
+        self.db_pool = db_pool
         self.save_to_file = save_to_file
         self.save_results_file = bool(save_results_file) and bool((filename or "").strip())
 
@@ -560,14 +527,11 @@ class DataPipeline:
         await self.queue.put((shard_key, data))
 
     def _write_impl(self, batch):
-        # ⚠️ 关键：按你的要求，顺序调整为 “先写 Redis，再写文件”
-        #
-        # 0) 同步写入 Redis（最重要；先做，保证入库优先）
-        if self.redis_pool is not None:
-            only_devices = [d for _, d in batch]
-            _, evicted = self.redis_pool.add_devices(only_devices)
-            if evicted:
-                logger.info(f"[redis] 设备池已满，已淘汰 {evicted} 条（按 use_count 最大）")
+        # 0) 同步写入设备池（最重要；先做，保证入库优先）
+        if self.db_pool is None:
+            raise RuntimeError("db_pool is required (Redis backend removed)")
+        only_devices = [d for _, d in batch]
+        _ = self.db_pool.add_devices(only_devices)
 
         # 1) 同步写入本地备份文件（可选）
         try:
@@ -576,7 +540,7 @@ class DataPipeline:
             logger.critical(f"[file] 致命：写入本地备份失败: {e}")
             raise
 
-        # 2) 写 results 文件（可选；最后做，避免影响 Redis）
+        # 2) 写 results 文件（可选；最后做，避免影响入库）
         if self.save_results_file:
             try:
                 with open(self.filename, 'a', encoding='utf-8') as f:
@@ -584,34 +548,56 @@ class DataPipeline:
                         line = json.dumps(item, ensure_ascii=False)
                         f.write(line + "\n")
             except Exception as e:
-                # 默认不致命：results 只是辅助日志；不要因为它阻塞 Redis 入库
+                # 默认不致命：results 只是辅助日志；不要因为它阻塞入库
                 logger.error(f"[results] 写入失败（已忽略）: {e}")
                 if Config.RESULTS_FATAL:
                     raise
 
     async def _consumer(self):
+        # ✅ 严格写入语义：
+        # - 只有当“写入成功”后，才对队列调用 task_done()
+        # - 写入失败不会丢数据/不会提前 task_done，而是原批次重试直到成功
+        batch_size = max(1, int(os.getenv("MWZZZH_PIPELINE_BATCH", "20") or "20"))
+        retry_base = float(os.getenv("MWZZZH_PIPELINE_RETRY_SEC", "1") or "1")
+        if retry_base <= 0:
+            retry_base = 1.0
+        retry_max = float(os.getenv("MWZZZH_PIPELINE_RETRY_MAX_SEC", "30") or "30")
+        if retry_max <= 0:
+            retry_max = 30.0
+
         batch: list[tuple[int | None, Dict[str, Any]]] = []
-        while self.running or not self.queue.empty():
+        retry = 0
+
+        async def flush_batch(items: list[tuple[int | None, Dict[str, Any]]]) -> None:
+            nonlocal retry
+            if not items:
+                return
+            while True:
+                try:
+                    await asyncio.get_event_loop().run_in_executor(self.executor, self._write_impl, items)
+                    # 写入成功：再统一 task_done（保证 queue.join() 真正代表“已落库/落盘”）
+                    for _ in items:
+                        self.queue.task_done()
+                    retry = 0
+                    return
+                except Exception as e:
+                    retry += 1
+                    # 有设备池写入/备份时：必须保证成功写入，因此无限重试（退避）
+                    delay = min(retry_base * (2 ** min(retry, 6)), retry_max)  # 上限约 64x
+                    logger.error(f"[pipeline] 写入失败(将重试) retry={retry} sleep={delay:.1f}s err={e}")
+                    await asyncio.sleep(delay)
+
+        while self.running or not self.queue.empty() or batch:
             try:
                 item = await asyncio.wait_for(self.queue.get(), timeout=1.0)
                 batch.append(item)
-                self.queue.task_done()
             except asyncio.TimeoutError:
                 pass
-            if len(batch) >= 20 or (not self.running and batch):
+
+            if len(batch) >= batch_size or (not self.running and batch):
                 to_write = batch[:]
                 batch.clear()
-                try:
-                    await asyncio.get_event_loop().run_in_executor(
-                        self.executor, self._write_impl, to_write
-                    )
-                except Exception as e:
-                    # 如果开启了 Redis，这里视为致命错误：立即退出
-                    if self.redis_pool is not None or self.save_to_file:
-                        logger.critical(f"[pipeline] 致命：写入失败，程序终止: {e}")
-                        os._exit(1)
-                    # 未开启 Redis：保留原行为，只记录错误继续
-                    logger.error(f"写入线程异常: {e}")
+                await flush_batch(to_write)
 
     async def stop(self):
         self.running = False
@@ -738,25 +724,26 @@ class SessionPool:
 class SpiderEngine:
     def __init__(self):
         self.proxy_cycle = cycle(Config.PROXIES)
+        backend = Config.DEVICE_POOL_BACKEND
+        if backend not in {"db", "mysql"}:
+            logger.critical(f"[cfg] DEVICE_POOL_BACKEND={backend} 不支持（已移除 Redis），请设置为 db/mysql")
+            raise SystemExit(1)
 
-        redis_pool = None
-        if Config.SAVE_TO_REDIS:
-            try:
-                rcfg = _get_redis_config(max_devices_default=Config.TASKS)
-                redis_pool = RedisDevicePool(rcfg)
-                redis_pool.ping()
-                logger.info(
-                    f"[redis] 启用成功 key_prefix={rcfg.key_prefix} id_field={rcfg.id_field} max={rcfg.max_size} "
-                    f"ids_key={redis_pool.ids_key} data_key={redis_pool.data_key} cur={redis_pool.count()}"
-                )
-            except Exception as e:
-                # Redis 打开时：连接失败直接终止程序
-                logger.critical(f"[redis] 启用失败，程序终止: {e}")
-                raise SystemExit(1)
+        try:
+            mcfg = _get_mysql_config()
+            db_pool = MySQLDevicePool(mcfg)
+            db_pool.ping()
+            logger.info(
+                f"[db] 启用成功 host={mcfg.host}:{mcfg.port} db={mcfg.db} table={mcfg.table} "
+                f"id_field={mcfg.id_field} shards={mcfg.shards} force_shard={mcfg.force_shard} cur={db_pool.count()}"
+            )
+        except Exception as e:
+            logger.critical(f"[db] 启用失败，程序终止: {e}")
+            raise SystemExit(1)
 
         self.pipeline = DataPipeline(
             Config.RESULT_FILE,
-            redis_pool=redis_pool,
+            db_pool=db_pool,
             save_to_file=Config.SAVE_TO_FILE,
             save_results_file=Config.SAVE_RESULTS_FILE,
         )
@@ -848,79 +835,83 @@ class SpiderEngine:
 async def _poll_fill_loop() -> None:
     """
     轮询补齐模式：
-    - 仅在 SAVE_TO_REDIS=1 时生效
-    - 每隔 POLL_INTERVAL_SEC 秒检查 Redis 设备池数量，若不足目标则补齐
+    - 全 DB：每隔 POLL_INTERVAL_SEC 秒检查 MySQL 设备池各 shard 数量，若不足目标则补齐
+    - 默认 run-once（MWZZZH_POLL_ONCE=1）：补齐后退出，适合 cron
     """
-    if not Config.SAVE_TO_REDIS:
-        logger.critical("[poll] MWZZZH_POLL_MODE 打开时必须同时打开 SAVE_TO_REDIS=1（需要检查 Redis 设备池数量）")
+    backend = Config.DEVICE_POOL_BACKEND
+    if backend not in {"db", "mysql"}:
+        logger.critical(f"[poll] DEVICE_POOL_BACKEND={backend} 不支持（已移除 Redis），请设置为 db/mysql")
         raise SystemExit(1)
 
     interval = max(1, int(Config.POLL_INTERVAL_SEC))
-    # 目标数量：统一使用 REDIS_MAX_DEVICES
-    target = max(0, int(Config.REDIS_MAX_DEVICES))
+    # 目标数量：每个 shard 的 target（与 dgemail 对齐）
+    target = max(0, int(Config.DB_MAX_DEVICES))
     batch_max = max(1, int(Config.POLL_BATCH_MAX))
     shards = max(1, int(Config.DEVICE_POOL_SHARDS))
+    run_once = bool(Config.POLL_ONCE)
+    max_total = max(0, int(Config.POLL_MAX_TOTAL))
+    filled_total = 0
 
     if target <= 0:
-        logger.critical("[poll] REDIS_MAX_DEVICES 需要 > 0")
+        logger.critical("[poll] DB_MAX_DEVICES 需要 > 0（每个 shard 的目标数量）")
+        raise SystemExit(1)
+    try:
+        base_cfg = _get_mysql_config()
+        db_pool = MySQLDevicePool(base_cfg)
+        db_pool.ping()
+    except Exception as e:
+        logger.critical(f"[poll] MySQL 连接/读取失败，程序终止: {e}")
         raise SystemExit(1)
 
-    # REDIS_TARGET_DEVICES 已废弃：若用户仍配置，提示但忽略
-    legacy_target = os.getenv("REDIS_TARGET_DEVICES")
-    if legacy_target is not None and legacy_target.strip():
-        logger.warning("[poll] 检测到已废弃配置 REDIS_TARGET_DEVICES，将忽略并以 REDIS_MAX_DEVICES 为准")
-
-    base_prefix = _normalize_pool_base(os.getenv("REDIS_DEVICE_POOL_KEY", "tiktok:device_pool").strip() or "tiktok:device_pool")
-    logger.info(f"[poll] 启动：interval={interval}s target={target} batch_max={batch_max} shards={shards} base_prefix={base_prefix}")
+    logger.info(
+        f"[poll] 启动：interval={interval}s target_per_shard={target} batch_max={batch_max} "
+        f"shards={shards} run_once={run_once} max_total={max_total}"
+    )
 
     while True:
-        try:
-            # 连接 Redis，读取每个池大小（失败视为致命）
-            # 规则：0号池为 base_prefix，其它池为 base_prefix:{idx}
-            pool_counts: list[tuple[int, int, str]] = []
-            for i in range(shards):
-                key_prefix = base_prefix if i == 0 else f"{base_prefix}:{i}"
-                os.environ["REDIS_DEVICE_POOL_KEY"] = key_prefix
-                rcfg = _get_redis_config(max_devices_default=target)
-                pool = RedisDevicePool(rcfg)
-                pool.ping()
-                cur = pool.count()
-                pool_counts.append((cur, i, key_prefix))
-        except Exception as e:
-            logger.critical(f"[poll] Redis 连接/读取失败，程序终止: {e}")
-            raise SystemExit(1)
+        pool_counts: list[tuple[int, int]] = []
+        for i in range(shards):
+            pool_counts.append((db_pool.count_shard(i), i))
 
-        # 选择一个“未满”的池子进行补齐：优先选择当前数量最少的池（达到平均分配）
+        # 选择一个“未满”的 shard：优先选择当前数量最少的（达到平均分配）
         pool_counts.sort(key=lambda x: x[0])
-        chosen: tuple[int, int, str] | None = None
-        for cur, idx, prefix in pool_counts:
+        chosen: tuple[int, int] | None = None
+        for cur, idx in pool_counts:
             if cur < target:
-                chosen = (cur, idx, prefix)
+                chosen = (cur, idx)
                 break
 
         if chosen is None:
-            logger.info(f"[poll] 所有设备池已满（每池 target={target}）sleep {interval}s")
+            logger.info(f"[poll] 所有 shard 已满（每 shard target={target}）")
+            if run_once:
+                return
             await asyncio.sleep(interval)
             continue
 
-        cur, idx, key_prefix = chosen
+        cur, idx = chosen
         missing = target - cur
         fill_n = min(missing, batch_max)
-        logger.info(f"[poll] 选择池 idx={idx} key_prefix={key_prefix} cur={cur} target={target} missing={missing} -> 本轮补齐 {fill_n}")
+        if max_total > 0:
+            remain = max_total - filled_total
+            if remain <= 0:
+                logger.info(f"[poll] 达到本次补齐上限 max_total={max_total}，退出")
+                return
+            if fill_n > remain:
+                fill_n = remain
 
-        # 本轮写入到选中的池子
-        os.environ["REDIS_DEVICE_POOL_KEY"] = key_prefix
+        logger.info(f"[poll] 选择 shard_id={idx} cur={cur} target={target} missing={missing} -> 本轮补齐 {fill_n}")
+
+        # 本轮写入到选中的 shard（仅用于补齐；设备唯一仍按 device_id）
+        os.environ["MWZZZH_DB_DEVICE_SHARD"] = str(idx)
         engine = SpiderEngine()
         await engine.run(tasks_n=fill_n)
-        # 立即回读一次数量，帮助定位“为什么每轮缺口都不变”
-        try:
-            rcfg2 = _get_redis_config(max_devices_default=target)
-            pool2 = RedisDevicePool(rcfg2)
-            cur2 = pool2.count()
-            logger.info(f"[poll] 本轮结束：key_prefix={rcfg2.key_prefix} cur={cur2} target={target} missing={max(0, target - cur2)}")
-        except Exception as e:
-            logger.warning(f"[poll] 本轮结束回读失败: {e}")
-        # 本轮跑完立即进入下一轮检查（不额外 sleep）
+        filled_total += fill_n
+
+        cur2 = db_pool.count_shard(idx)
+        logger.info(f"[poll] 本轮结束：shard_id={idx} cur={cur2} target={target} missing={max(0, target - cur2)} filled_total={filled_total}")
+
+        if not run_once:
+            await asyncio.sleep(interval)
 
 
 if __name__ == "__main__":
