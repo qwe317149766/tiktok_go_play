@@ -451,11 +451,15 @@ logger.addHandler(fh)
 # 启动可观测性：告诉你 env 是否加载成功、是否会写 Redis
 try:
     logger.info(
-        "[env] loaded=%s | SAVE_TO_REDIS=%s | REDIS_DEVICE_POOL_KEY=%s | REDIS_DB=%s",
+        "[env] loaded=%s | SAVE_TO_REDIS=%s | REDIS_DEVICE_POOL_KEY=%s | REDIS_DB=%s | REDIS_URL=%s | REDIS_HOST=%s | REDIS_PORT=%s | REDIS_SSL=%s",
         _MWZZZH_ENV_FILE,
         os.getenv("SAVE_TO_REDIS"),
         os.getenv("REDIS_DEVICE_POOL_KEY"),
         os.getenv("REDIS_DB"),
+        os.getenv("REDIS_URL"),
+        os.getenv("REDIS_HOST"),
+        os.getenv("REDIS_PORT"),
+        os.getenv("REDIS_SSL"),
     )
 except Exception:
     pass
@@ -728,7 +732,10 @@ class SpiderEngine:
                 rcfg = _get_redis_config(max_devices_default=Config.TASKS)
                 redis_pool = RedisDevicePool(rcfg)
                 redis_pool.ping()
-                logger.info(f"[redis] 启用成功 key_prefix={rcfg.key_prefix} id_field={rcfg.id_field} max={rcfg.max_size}")
+                logger.info(
+                    f"[redis] 启用成功 key_prefix={rcfg.key_prefix} id_field={rcfg.id_field} max={rcfg.max_size} "
+                    f"ids_key={redis_pool.ids_key} data_key={redis_pool.data_key} cur={redis_pool.count()}"
+                )
             except Exception as e:
                 # Redis 打开时：连接失败直接终止程序
                 logger.critical(f"[redis] 启用失败，程序终止: {e}")
