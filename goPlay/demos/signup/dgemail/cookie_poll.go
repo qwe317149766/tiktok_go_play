@@ -144,7 +144,26 @@ func runCookiePollLoop() {
 		log.Fatalf("[poll] 设备列表为空，无法补齐 cookies")
 	}
 
-	proxyPath := findTopmostFileUpwards("proxies.txt", 8)
+	// 轮询补齐模式同样需要代理：优先读取 dgemail 自己目录下的代理（避免误读仓库根目录的 proxies.txt）
+	// 优先级与 main.go 对齐：
+	// - PROXIES_FILE
+	// - SIGNUP_PROXIES_FILE
+	// - 当前目录 proxies.txt
+	// - 当前目录 data/proxies.txt
+	// - 向上查找仓库根目录 proxies.txt（兜底兼容）
+	proxyPath := strings.TrimSpace(getEnvStr("PROXIES_FILE", ""))
+	if proxyPath == "" {
+		proxyPath = strings.TrimSpace(getEnvStr("SIGNUP_PROXIES_FILE", ""))
+	}
+	if proxyPath == "" && fileExists("proxies.txt") {
+		proxyPath = "proxies.txt"
+	}
+	if proxyPath == "" && fileExists("data/proxies.txt") {
+		proxyPath = "data/proxies.txt"
+	}
+	if proxyPath == "" {
+		proxyPath = findTopmostFileUpwards("proxies.txt", 8)
+	}
 	if proxyPath == "" {
 		proxyPath = "data/proxies.txt"
 	}
