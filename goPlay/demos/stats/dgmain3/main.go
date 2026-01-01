@@ -1698,18 +1698,19 @@ func main() {
 		os.Exit(1)
 	} else if shouldLoadCookiesFromDB() {
 		// 从数据库独立加载 cookies（不依赖设备）
+		// 初始加载：并发数 * 5
 		limit := envInt("COOKIES_LIMIT", 0)
 		if limit <= 0 {
-			limit = config.MaxConcurrency
+			limit = config.MaxConcurrency * 5
 		}
 		if limit <= 0 {
-			limit = 100
+			limit = 500
 		}
 		pollSec := envInt("STATS_ACCOUNT_POLL_INTERVAL_SEC", envInt("STATS_COOKIE_POLL_INTERVAL_SEC", envInt("COOKIES_POLL_INTERVAL_SEC", 10)))
 		if pollSec <= 0 {
 			pollSec = 10
 		}
-		fmt.Printf("cookies 来源=db table=%s（从账号池独立加载 cookies）\n", dbCookiePoolTable())
+		fmt.Printf("cookies 来源=db table=%s（从账号池独立加载 cookies，初始目标=%d=并发数*5）\n", dbCookiePoolTable(), limit)
 		var cookies []CookieRecord
 		for {
 			accounts, err := loadStartupAccountsFromDBN(limit)
@@ -1723,8 +1724,9 @@ func main() {
 				dbCookiePoolTable(), pollSec)
 			time.Sleep(time.Duration(pollSec) * time.Second)
 		}
-		globalCookiePool = cookies
-		fmt.Printf("已从MySQL cookies 池加载 %d 份 cookies（目标=%d）\n", len(globalCookiePool), limit)
+		// 直接替换内存中的 cookies（不是追加）
+		replaceCookiePool(cookies)
+		fmt.Printf("已从MySQL cookies 池加载 %d 份 cookies（目标=%d）\n", len(cookies), limit)
 	} else if shouldLoadStartupAccountsFromDB() {
 		// 从设备同源的账号 JSON 提取 cookies（设备+cookies 同源）
 		limit := envInt("COOKIES_LIMIT", 0)
@@ -1767,8 +1769,73 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// 启动自动补全线程：检测内存 cookies 数量，<2*并发数时补全到3*并发数
+	go startCookieAutoRefillThread(config.MaxConcurrency)
+
 	engine.Run()
 	// 总耗时已在Run()方法中打印
+}
+
+// startCookieAutoRefillThread 自动补全线程：检测内存 cookies 数量，<2*并发数时补全到3*并发数
+func startCookieAutoRefillThread(maxConcurrency int) {
+	if maxConcurrency <= 0 {
+		maxConcurrency = 100
+	}
+	checkInterval := envInt("STATS_COOKIE_REFILL_INTERVAL_SEC", 5) // 检查间隔（秒）
+	if checkInterval <= 0 {
+		checkInterval = 5
+	}
+	minThreshold := maxConcurrency * 2  // 最小阈值：2*并发数
+	targetCount := maxConcurrency * 3   // 目标数量：3*并发数
+
+	ticker := time.NewTicker(time.Duration(checkInterval) * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		currentSize := getCookiePoolSize()
+		if currentSize < minThreshold {
+			needCount := targetCount - currentSize
+			if needCount > 0 {
+				log.Printf("[cookie-refill] 当前 cookies 数量=%d < 阈值=%d，开始补全到 %d（需要补充 %d 个）", currentSize, minThreshold, targetCount, needCount)
+				// 从数据库加载新的 cookies
+				accounts, err := loadStartupAccountsFromDBN(needCount)
+				if err == nil && len(accounts) > 0 {
+					newCookies := loadCookiesFromStartupDevices(accounts, needCount)
+					if len(newCookies) > 0 {
+						// 获取当前池中的 cookie IDs，避免重复
+						cookiePoolMu.RLock()
+						existingIDs := make(map[string]bool)
+						for _, rec := range globalCookiePool {
+							existingIDs[rec.ID] = true
+						}
+						cookiePoolMu.RUnlock()
+
+						// 过滤掉已存在的 cookies
+						filteredCookies := make([]CookieRecord, 0, len(newCookies))
+						for _, rec := range newCookies {
+							if !existingIDs[rec.ID] {
+								filteredCookies = append(filteredCookies, rec)
+							}
+						}
+
+						if len(filteredCookies) > 0 {
+							// 追加到内存池中（不是替换）
+							cookiePoolMu.Lock()
+							globalCookiePool = append(globalCookiePool, filteredCookies...)
+							newSize := len(globalCookiePool)
+							cookiePoolMu.Unlock()
+							log.Printf("[cookie-refill] 补全完成：新增 %d 个 cookies，当前总数=%d", len(filteredCookies), newSize)
+						} else {
+							log.Printf("[cookie-refill] 补全失败：新加载的 cookies 都已存在于内存池中")
+						}
+					}
+				} else {
+					log.Printf("[cookie-refill] 补全失败：无法从数据库加载 cookies（err=%v）", err)
+				}
+			}
+		}
+	}
 }
 
 // 分片：全 DB 模式使用 MySQL 表的 shard_id 字段分片。

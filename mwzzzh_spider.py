@@ -8,9 +8,10 @@ import traceback
 import time
 import platform
 import signal
+from datetime import datetime
 from itertools import cycle
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -225,6 +226,53 @@ def _stable_shard(device_id: str, shards: int) -> int:
     return int(h[:8], 16) % shards
 
 
+def _parse_create_time(create_time_val: Any) -> Optional[datetime]:
+    """解析 create_time 字段，返回 datetime 对象或 None"""
+    if create_time_val is None:
+        return None
+
+    # 字符串格式
+    if isinstance(create_time_val, str):
+        create_time_str = create_time_val.strip()
+        if not create_time_str:
+            return None
+
+        # 尝试常见时间格式
+        formats = [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+        ]
+        for fmt in formats:
+            try:
+                return datetime.strptime(create_time_str, fmt)
+            except ValueError:
+                continue
+
+        # 尝试 Unix 时间戳（秒或毫秒）
+        try:
+            ts = float(create_time_str)
+            if ts > 1e10:  # 毫秒时间戳
+                ts = ts / 1000
+            return datetime.fromtimestamp(ts)
+        except (ValueError, OSError):
+            pass
+
+    # 数字格式（Unix 时间戳）
+    if isinstance(create_time_val, (int, float)):
+        ts = float(create_time_val)
+        if ts > 1e10:  # 毫秒时间戳
+            ts = ts / 1000
+        try:
+            return datetime.fromtimestamp(ts)
+        except (OSError, ValueError):
+            pass
+
+    return None
+
+
 class MySQLDevicePool:
     """
     MySQL 设备池：注册成功设备写入 MySQL，替代 Redis device_pool。
@@ -307,12 +355,16 @@ class MySQLDevicePool:
             else:
                 shard = _stable_shard(did, int(self.cfg.shards))
             raw = json.dumps(dev, ensure_ascii=False, separators=(",", ":"))
-            rows.append((shard, did, raw))
+            
+            # 提取 device_create_time（从 device_json 中的 create_time 字段）
+            device_create_time = _parse_create_time(dev.get("create_time"))
+            
+            rows.append((shard, did, raw, device_create_time))
 
         sql = (
-            f"INSERT INTO `{table}` (shard_id, device_id, device_json) "
-            f"VALUES (%s,%s,%s) "
-            f"ON DUPLICATE KEY UPDATE device_json=VALUES(device_json), updated_at=CURRENT_TIMESTAMP"
+            f"INSERT INTO `{table}` (shard_id, device_id, device_json, device_create_time) "
+            f"VALUES (%s,%s,%s,%s) "
+            f"ON DUPLICATE KEY UPDATE device_json=VALUES(device_json), device_create_time=VALUES(device_create_time), updated_at=CURRENT_TIMESTAMP"
         )
         with c.cursor() as cur:
             cur.executemany(sql, rows)
@@ -388,8 +440,8 @@ class Config:
     # 设备池分片数量：对应 device_pool_devices.shard_id
     DEVICE_POOL_SHARDS = _get_int_from_env("DB_DEVICE_POOL_SHARDS", default=1)
 
-    # run-once：补齐后退出（适合 cron）
-    POLL_ONCE = _parse_bool(os.getenv("MWZZZH_POLL_ONCE"), True)
+    # run-once：补齐后退出（适合 cron）。默认 False（持续轮询）
+    POLL_ONCE = _parse_bool(os.getenv("MWZZZH_POLL_ONCE"), False)
     # 单次 run 最大补齐总量（0=不限制）
     POLL_MAX_TOTAL = _get_int_from_env("MWZZZH_POLL_MAX_TOTAL", default=0)
 
@@ -882,8 +934,9 @@ async def _poll_fill_loop() -> None:
                 break
 
         if chosen is None:
-            logger.info(f"[poll] 所有 shard 已满（每 shard target={target}）")
+            logger.info(f"[poll] 所有 shard 已满（每 shard target={target}），等待 {interval}s 后重新检查...")
             if run_once:
+                logger.info(f"[poll] run_once=True，退出轮询")
                 return
             await asyncio.sleep(interval)
             continue
@@ -910,8 +963,18 @@ async def _poll_fill_loop() -> None:
         cur2 = db_pool.count_shard(idx)
         logger.info(f"[poll] 本轮结束：shard_id={idx} cur={cur2} target={target} missing={max(0, target - cur2)} filled_total={filled_total}")
 
-        if not run_once:
-            await asyncio.sleep(interval)
+        # 持续轮询模式：处理完毕后立即重新检查（不 sleep），如果所有 shard 已满才 sleep
+        # run_once 模式：处理完毕后退出
+        if run_once:
+            if max_total > 0 and filled_total >= max_total:
+                logger.info(f"[poll] 达到本次补齐上限 max_total={max_total}，退出")
+                return
+            # run_once 模式下，如果所有 shard 已满，会在下一轮循环中退出
+            # 否则继续下一轮补齐
+        else:
+            # 持续轮询模式：处理完毕后立即重新检查（不 sleep）
+            # 如果所有 shard 已满，会在下一轮循环中 sleep
+            pass
 
 
 if __name__ == "__main__":
@@ -942,8 +1005,19 @@ if __name__ == "__main__":
         if Config.POLL_MODE:
             asyncio.run(_poll_fill_loop())
         else:
-            engine = SpiderEngine()
-            asyncio.run(engine.run())
+            # 非轮询模式：直接进入持续轮询模式（不再先执行一次固定任务）
+            # 确保 POLL_ONCE=False，以便持续轮询而不退出
+            original_poll_once = os.getenv("MWZZZH_POLL_ONCE")
+            os.environ["MWZZZH_POLL_ONCE"] = "0"
+            logger.info("非轮询模式，自动进入持续轮询模式（检查设备池并补齐，POLL_ONCE=0）...")
+            try:
+                asyncio.run(_poll_fill_loop())
+            finally:
+                # 恢复原始配置
+                if original_poll_once is not None:
+                    os.environ["MWZZZH_POLL_ONCE"] = original_poll_once
+                else:
+                    os.environ.pop("MWZZZH_POLL_ONCE", None)
     except KeyboardInterrupt:
         print("收到 Ctrl+C，已退出（建议开启 MWZZZH_FILE_FSYNC=1 提升异常退出不丢数据概率）")
     t1 = time.time()

@@ -17,6 +17,36 @@ var (
 	cookieReplacedTotal int64
 )
 
+// replaceCookiePool 替换内存中的 cookie 池（不是追加）
+func replaceCookiePool(newCookies []CookieRecord) {
+	cookiePoolMu.Lock()
+	globalCookiePool = newCookies
+	cookiePoolMu.Unlock()
+}
+
+// removeCookieFromPool 从内存中删除指定的 cookie
+func removeCookieFromPool(cookieID string) {
+	if cookieID == "" || cookieID == "default" {
+		return
+	}
+	cookiePoolMu.Lock()
+	defer cookiePoolMu.Unlock()
+	newPool := make([]CookieRecord, 0, len(globalCookiePool))
+	for _, rec := range globalCookiePool {
+		if rec.ID != cookieID {
+			newPool = append(newPool, rec)
+		}
+	}
+	globalCookiePool = newPool
+}
+
+// getCookiePoolSize 获取当前内存中的 cookie 数量
+func getCookiePoolSize() int {
+	cookiePoolMu.RLock()
+	defer cookiePoolMu.RUnlock()
+	return len(globalCookiePool)
+}
+
 func banCookie(id string) {
 	if id == "" || id == "default" {
 		return
