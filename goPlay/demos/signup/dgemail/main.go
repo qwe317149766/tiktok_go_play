@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"log"
 	"math/rand"
@@ -161,6 +162,15 @@ func writeToRolledFile(acc map[string]interface{}) {
 }
 
 func main() {
+	// 命令行参数支持
+	cliConfig := flag.String("config", "", "指定配置文件路径 (e.g. -config env.linux)")
+	cliProxy := flag.String("proxy", "", "指定代理文件路径 (e.g. -proxy proxies.txt)")
+	flag.Parse()
+
+	if *cliConfig != "" {
+		os.Setenv("ENV_FILE", *cliConfig)
+	}
+
 	fmt.Println("=== TikTok 邮箱批量注册工具 ===")
 	fmt.Println()
 
@@ -231,13 +241,14 @@ func main() {
 	}
 
 	// 3. 读取代理列表
-	// 代理文件优先级（按你的需求：优先读取 dgemail 自己目录下的代理，而不是仓库根目录）
-	// - PROXIES_FILE（统一配置，推荐）
-	// - SIGNUP_PROXIES_FILE（signup 专用，兼容）
-	// - 当前目录 proxies.txt
-	// - 当前目录 data/proxies.txt（旧默认）
-	// - 最后兜底：向上查找仓库根目录 proxies.txt（兼容旧项目统一代理）
-	proxyPath := strings.TrimSpace(getEnvStr("PROXIES_FILE", ""))
+	// 代理文件优先级：命令行 > PROXIES_FILE > SIGNUP_PROXIES_FILE > ...
+	proxyPath := ""
+	if cliProxy != nil && *cliProxy != "" {
+		proxyPath = *cliProxy
+	}
+	if proxyPath == "" {
+		proxyPath = strings.TrimSpace(getEnvStr("PROXIES_FILE", ""))
+	}
 	if proxyPath == "" {
 		proxyPath = strings.TrimSpace(getEnvStr("SIGNUP_PROXIES_FILE", ""))
 	}

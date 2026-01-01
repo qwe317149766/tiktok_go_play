@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"compress/gzip"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -1694,6 +1695,15 @@ func loadLines(filename string) ([]string, error) {
 }
 
 func main() {
+	// 命令行参数支持
+	cliConfig := flag.String("config", "", "指定配置文件路径 (e.g. -config env.linux)")
+	cliProxy := flag.String("proxy", "", "指定代理文件路径 (e.g. -proxy proxies.txt)")
+	flag.Parse()
+
+	if *cliConfig != "" {
+		os.Setenv("ENV_FILE", *cliConfig)
+	}
+
 	rand.Seed(time.Now().UnixNano())
 	loadEnvForDemo()
 
@@ -1710,8 +1720,14 @@ func main() {
 		config.MaxConcurrency = v
 	}
 
-	// 代理文件路径：优先从 env 读取，支持 STATS_PROXIES_FILE 单独配置
-	proxiesPath := strings.TrimSpace(envStr("STATS_PROXIES_FILE", ""))
+	// 代理文件路径优先级：命令行参数 > STATS_PROXIES_FILE > PROXIES_FILE > 自动查找
+	proxiesPath := ""
+	if cliProxy != nil && *cliProxy != "" {
+		proxiesPath = *cliProxy
+	}
+	if proxiesPath == "" {
+		proxiesPath = strings.TrimSpace(envStr("STATS_PROXIES_FILE", ""))
+	}
 	if proxiesPath == "" {
 		proxiesPath = strings.TrimSpace(envStr("PROXIES_FILE", ""))
 	}
@@ -1749,7 +1765,7 @@ func main() {
 		}
 		fmt.Printf("已加载 %d 个代理\n", len(config.Proxies))
 	} else {
-		fmt.Printf("缺少 proxies.txt（请在仓库根目录放 proxies.txt）: %v\n", err)
+		fmt.Printf("缺少代理文件（%s）: %v\n", proxiesPath, err)
 		os.Exit(1)
 	}
 
