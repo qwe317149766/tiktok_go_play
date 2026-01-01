@@ -42,6 +42,124 @@ var (
 	results      []RegisterResult
 )
 
+// 异步写入通道
+var (
+	asyncDBChan   = make(chan asyncDBItem, 5000)
+	asyncFileChan = make(chan map[string]interface{}, 5000)
+)
+
+type asyncDBItem struct {
+	acc      map[string]interface{}
+	deviceID string
+}
+
+func init() {
+	// 启动异步 DB 写入线程 (消费者)
+	go func() {
+		for item := range asyncDBChan {
+			// 100% 确认重试逻辑
+			maxRetries := 5
+			success := false
+			var err error
+			for i := 0; i < maxRetries; i++ {
+				if err = writeStartupAccountToDB(item.acc); err == nil {
+					success = true
+					break
+				}
+				time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+			}
+			if success {
+				fmt.Printf("✅ [数据库-Async] 写入成功: %s\n", item.deviceID)
+			} else {
+				fmt.Printf("❌ [数据库-Async] 写入彻底失败(%d次重试): %s error: %v\n", maxRetries, item.deviceID, err)
+				// 严重错误：写入失败的数据应记录到单独的 error 文件防止丢失
+				logErrorData("db_write_failed.log", item.acc)
+			}
+		}
+	}()
+
+	// 启动异步文件写入线程 (消费者) - 10MB 滚动
+	go func() {
+		for acc := range asyncFileChan {
+			writeToRolledFile(acc)
+		}
+	}()
+}
+
+func logErrorData(filename string, data interface{}) {
+	f, err := os.OpenFile(filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err == nil {
+		defer f.Close()
+		b, _ := json.Marshal(data)
+		f.WriteString(string(b) + "\n")
+	}
+}
+
+func enqueueAsyncDBWrite(acc map[string]interface{}, deviceID string) {
+	select {
+	case asyncDBChan <- asyncDBItem{acc: acc, deviceID: deviceID}:
+	default:
+		fmt.Printf("❌ [Async-DB] 队列已满，阻塞等待写入: %s\n", deviceID)
+		asyncDBChan <- asyncDBItem{acc: acc, deviceID: deviceID}
+	}
+}
+
+func enqueueAsyncFileWrite(acc map[string]interface{}) {
+	select {
+	case asyncFileChan <- acc:
+	default:
+		asyncFileChan <- acc
+	}
+}
+
+// writeToRolledFile 写入到 res/日期-注册成功.txt，每 10MB 滚动一次
+func writeToRolledFile(acc map[string]interface{}) {
+	// 确保 res 目录
+	os.MkdirAll("res", 0755)
+
+	// 生成基础文件名: res/20260102-注册成功.txt
+	dateStr := time.Now().Format("20060102")
+	baseName := fmt.Sprintf("res/%s-注册成功.txt", dateStr)
+
+	// 检查当前文件大小
+	targetFile := baseName
+
+	// 滚动逻辑：检查是否超过 10MB
+	// 如果 baseName 超过 10MB，则寻找 baseName.1, baseName.2 ...
+	// 简单实现：总是写入到“最后一个未生满的文件”
+	// 实际上，为了性能，我们通常只检查当前正在写的文件
+	// 这里用简单轮询查找最新分片
+	for i := 0; ; i++ {
+		fname := baseName
+		if i > 0 {
+			fname = fmt.Sprintf("res/%s-注册成功_%d.txt", dateStr, i)
+		}
+
+		info, err := os.Stat(fname)
+		if os.IsNotExist(err) {
+			// 文件不存在，直接用
+			targetFile = fname
+			break
+		}
+		if info.Size() < 10*1024*1024 { // < 10MB
+			targetFile = fname
+			break
+		}
+		// 文件已满，继续找下一个
+	}
+
+	f, err := os.OpenFile(targetFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Printf("[File-Write] Open error: %v", err)
+		return
+	}
+	defer f.Close()
+
+	// 写入格式：这里写入 JSON string
+	b, _ := json.Marshal(acc)
+	f.WriteString(string(b) + "\n")
+}
+
 func main() {
 	fmt.Println("=== TikTok 邮箱批量注册工具 ===")
 	fmt.Println()
@@ -146,11 +264,21 @@ func main() {
 	InitProxyManager(proxies)
 
 	// 4. 设置并发数（降低并发以提高成功率）
+	// 4. 设置并发数（降低并发以提高成功率）
 	maxConcurrency := getEnvInt("SIGNUP_CONCURRENCY", 50)
 	if maxConcurrency <= 0 {
 		maxConcurrency = 50
 	}
-	fmt.Printf("并发数: %d (来自 SIGNUP_CONCURRENCY)\n", maxConcurrency)
+	// 动态调整并发数：如果设备数量少于并发数，则降级并发数为设备数量（每个设备最多占用一个并发）
+	// 注意：设备数量可能为0（生成模式），此时不限制
+	if len(devices) > 0 {
+		if len(devices) < maxConcurrency {
+			fmt.Printf("⚠️  设备数量(%d) < 配置并发(%d)，自动降级并发数为 %d\n", len(devices), maxConcurrency, len(devices))
+			maxConcurrency = len(devices)
+		}
+	}
+
+	fmt.Printf("并发数: %d (来自 SIGNUP_CONCURRENCY, 受设备数限制)\n", maxConcurrency)
 	fmt.Println()
 
 	// DB 模式：注册成功会直接写入 MySQL cookies 池（startup_cookie_accounts）
@@ -428,18 +556,16 @@ func registerAccounts(accounts []AccountInfo, devices []map[string]interface{}, 
 				// 要求：写入 DB/文件 的 JSON 必须一致
 				if len(result.Cookies) > 0 {
 					accJSON := buildStartupAccountJSON(deviceRaw, result.Cookies)
-					// 1) 写入 MySQL cookies 池（全 DB 模式）
-					// 1) 写入 MySQL cookies 池（全 DB 模式）
-					// 强制写入数据库
-					if err := writeStartupAccountToDB(accJSON); err != nil {
-						fmt.Printf("❌ [数据库] 写入失败: %v\n", err)
-					} else {
-						fmt.Printf("✅ [数据库] 写入成功: %s\n", result.DeviceID)
-					}
-					// 2) 实时写入 Log/ startup_accounts_*.jsonl（与 DB 完全一致）
+					// 1) 异步写入 MySQL cookies 池
+					enqueueAsyncDBWrite(accJSON, result.DeviceID)
+
+					// 2) 异步写入文件 (10M 滚动, res/DATE-注册成功.txt)
+					enqueueAsyncFileWrite(accJSON)
+
+					// 3) 实时写入 Log/ startup_accounts_*.jsonl（与 DB 完全一致）- 现有逻辑保留
 					appendStartupAccountJSONLFixed(accJSON)
 				}
-				// ✅ signup 设备淘汰策略：成功次数 >3 删设备；连续失败 >10 也删设备
+				// ✅ signup 设备淘汰策略
 				signupDeviceUsageUpdate(result.DeviceID, true)
 			} else {
 				atomic.AddInt64(&failedCount, 1)
