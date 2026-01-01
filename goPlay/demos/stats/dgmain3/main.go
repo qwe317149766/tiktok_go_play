@@ -1338,6 +1338,15 @@ func (e *Engine) taskWrapper(taskID int) {
 		if e.deviceManager != nil {
 			// 注意：连续失败需要排除网络错误（network_error=true 不累加 ConsecutiveFailures）
 			isNetworkError, _ := extra["network_error"].(bool)
+			stage, _ := extra["stage"].(string)
+			reason, _ := extra["reason"].(string)
+
+			// 用户偏好：empty response 和 stats 错误不计入连续失败淘汰
+			// 只有明确的非网络、非stats业务逻辑错误才淘汰
+			if reason == "empty response" || stage == "stats" {
+				isNetworkError = true
+			}
+
 			e.deviceManager.RecordFailure(poolID, isNetworkError)
 			// 方式A：仅在“非网络错误导致的连续失败”达到阈值后动态补位
 			if !isNetworkError {
