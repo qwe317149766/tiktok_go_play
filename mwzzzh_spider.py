@@ -25,17 +25,41 @@ def _load_env_for_runtime() -> str | None:
     - Windows: .env.windows / env.windows
     - Linux:   .env.linux   / env.linux
     """
+    # 1) 显式指定（与 Go demos 对齐）：ENV_FILE=/path/to/env.linux
+    explicit = (os.getenv("ENV_FILE") or "").strip()
+    if explicit and os.path.exists(explicit):
+        try:
+            from dotenv import load_dotenv  # type: ignore
+            load_dotenv(explicit, override=True)
+        except Exception:
+            pass
+        return explicit
+
     sysname = platform.system().lower()
     if "windows" in sysname:
         candidates = [".env.windows", "env.windows"]
     else:
         candidates = [".env.linux", "env.linux"]
 
-    env_path = None
+    # 2) 优先在当前工作目录找
     for p in candidates:
         if os.path.exists(p):
             env_path = p
             break
+    else:
+        env_path = None
+
+    # 3) 再在脚本所在目录找（避免 “从 ~ 执行脚本” 时找不到 env.linux）
+    if not env_path:
+        try:
+            base = Path(__file__).resolve().parent
+            for p in candidates:
+                cand = base / p
+                if cand.exists():
+                    env_path = str(cand)
+                    break
+        except Exception:
+            env_path = None
 
     if not env_path:
         return None
@@ -391,6 +415,18 @@ fh = logging.FileHandler(Config.ERROR_FILE, encoding='utf-8')
 fh.setLevel(logging.ERROR)
 fh.setFormatter(formatter)
 logger.addHandler(fh)
+
+# 启动可观测性：告诉你 env 是否加载成功、是否会写 Redis
+try:
+    logger.info(
+        "[env] loaded=%s | SAVE_TO_REDIS=%s | REDIS_DEVICE_POOL_KEY=%s | REDIS_DB=%s",
+        _MWZZZH_ENV_FILE,
+        os.getenv("SAVE_TO_REDIS"),
+        os.getenv("REDIS_DEVICE_POOL_KEY"),
+        os.getenv("REDIS_DB"),
+    )
+except Exception:
+    pass
 
 
 # ================= 3. 数据管道 (保持不变) =================
