@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS device_pool_devices (
   shard_id INT NOT NULL DEFAULT 0 COMMENT 'Shard index (0..N-1)',
   device_id VARCHAR(128) NOT NULL COMMENT 'Unique device id (cdid/device_id/...)',
   device_json MEDIUMTEXT NOT NULL COMMENT 'Raw device JSON',
+  device_create_time TIMESTAMP NULL DEFAULT NULL COMMENT 'Device registration time (extracted from device_json.create_time)',
   use_count BIGINT NOT NULL DEFAULT 0 COMMENT 'use_count (compat with redis :use)',
   fail_count BIGINT NOT NULL DEFAULT 0 COMMENT 'fail_count (compat with redis :fail)',
   play_count BIGINT NOT NULL DEFAULT 0 COMMENT 'play_count (compat with redis :play)',
@@ -74,7 +75,8 @@ CREATE TABLE IF NOT EXISTS device_pool_devices (
   KEY idx_shard_id_id (shard_id, id),
   KEY idx_shard_use (shard_id, use_count),
   KEY idx_shard_play (shard_id, play_count),
-  KEY idx_shard_attempt (shard_id, attempt_count)
+  KEY idx_shard_attempt (shard_id, attempt_count),
+  KEY idx_shard_create_time (shard_id, device_create_time) COMMENT 'Filter devices by age'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Device pool devices (DB backend)';
 
 -- cookies 池（MySQL 版）：signup(dgemail) 注册成功后写入，stats 从这里读取（device+cookies 同源）
@@ -83,6 +85,7 @@ CREATE TABLE IF NOT EXISTS startup_cookie_accounts (
   shard_id INT NOT NULL DEFAULT 0,
   device_key VARCHAR(128) NOT NULL COMMENT 'device_id (preferred) or cdid (fallback)',
   account_json MEDIUMTEXT NOT NULL COMMENT 'Full account JSON including cookies field',
+  device_create_time TIMESTAMP NULL DEFAULT NULL COMMENT 'Device registration time (extracted from account_json.create_time)',
   use_count BIGINT NOT NULL DEFAULT 0,
   fail_count BIGINT NOT NULL DEFAULT 0,
   created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -90,7 +93,8 @@ CREATE TABLE IF NOT EXISTS startup_cookie_accounts (
   PRIMARY KEY (id),
   UNIQUE KEY uk_device_key (device_key),
   KEY idx_shard_id_id (shard_id, id),
-  KEY idx_shard_use (shard_id, use_count)
+  KEY idx_shard_use (shard_id, use_count),
+  KEY idx_shard_create_time (shard_id, device_create_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Startup cookie accounts (DB backend)';
 
 -- 通用计数器（用于 dgemail 生成跨进程不重复邮箱序号等）
