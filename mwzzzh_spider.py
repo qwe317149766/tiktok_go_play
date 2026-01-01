@@ -380,8 +380,14 @@ class Config:
     PROXIES = [
     ]
 
-    RESULT_FILE = "results12_21_5.jsonl"
+    # 结果文件（可选）：不需要写入可通过 MWZZZH_SAVE_RESULTS_FILE=0 关闭
+    RESULT_FILE = os.getenv("MWZZZH_RESULT_FILE", os.getenv("RESULT_FILE", "results12_21_5.jsonl"))
     ERROR_FILE = "error.log"
+
+    # 是否写入结果文件（results*.jsonl）
+    # - 默认开启（保持兼容）
+    # - 如果你不需要 results 文件，设置 MWZZZH_SAVE_RESULTS_FILE=0 可避免打开该文件
+    SAVE_RESULTS_FILE = _parse_bool(os.getenv("MWZZZH_SAVE_RESULTS_FILE"), True)
 
     # 是否保存“注册成功设备”到 Redis
     SAVE_TO_REDIS = _parse_bool(os.getenv("SAVE_TO_REDIS"), False)
@@ -467,7 +473,7 @@ except Exception:
 
 # ================= 3. 数据管道 (保持不变) =================
 class DataPipeline:
-    def __init__(self, filename, redis_pool: RedisDevicePool | None = None, save_to_file: bool = False):
+    def __init__(self, filename, redis_pool: RedisDevicePool | None = None, save_to_file: bool = False, save_results_file: bool = True):
         self.filename = filename
         self.queue = asyncio.Queue()
         self.executor = ThreadPoolExecutor(max_workers=1)
@@ -475,6 +481,7 @@ class DataPipeline:
         self._writer_task = None
         self.redis_pool = redis_pool
         self.save_to_file = save_to_file
+        self.save_results_file = bool(save_results_file) and bool((filename or "").strip())
 
         # 本地备份：按“线程数/分片数”写多个文件（每个分片一个文件）
         self._file_fps = None
@@ -549,15 +556,17 @@ class DataPipeline:
         await self.queue.put((shard_key, data))
 
     def _write_impl(self, batch):
-        try:
-            with open(self.filename, 'a', encoding='utf-8') as f:
-                for _, item in batch:
-                    line = json.dumps(item, ensure_ascii=False)
-                    f.write(line + "\n")
-        except Exception as e:
-            logger.error(f"写入失败: {e}")
-            # results 文件都写不进去时，直接抛给上层（让线程退出）
-            raise
+        # 1) 写 results 文件（可选）
+        if self.save_results_file:
+            try:
+                with open(self.filename, 'a', encoding='utf-8') as f:
+                    for _, item in batch:
+                        line = json.dumps(item, ensure_ascii=False)
+                        f.write(line + "\n")
+            except Exception as e:
+                logger.error(f"写入失败: {e}")
+                # results 文件都写不进去时，直接抛给上层（让线程退出）
+                raise
 
         # 同步写入本地备份文件（在 executor 线程中执行）
         try:
@@ -741,7 +750,12 @@ class SpiderEngine:
                 logger.critical(f"[redis] 启用失败，程序终止: {e}")
                 raise SystemExit(1)
 
-        self.pipeline = DataPipeline(Config.RESULT_FILE, redis_pool=redis_pool, save_to_file=Config.SAVE_TO_FILE)
+        self.pipeline = DataPipeline(
+            Config.RESULT_FILE,
+            redis_pool=redis_pool,
+            save_to_file=Config.SAVE_TO_FILE,
+            save_results_file=Config.SAVE_RESULTS_FILE,
+        )
         self.sem = asyncio.Semaphore(Config.MAX_CONCURRENCY)
 
         # 【新增】计算型线程池
