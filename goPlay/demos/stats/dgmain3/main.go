@@ -231,7 +231,17 @@ func (rw *ResultWriter) Dropped() int64 {
 	return atomic.LoadInt64(&rw.dropped)
 }
 
+func isSimpleLog() bool {
+	// 用户反馈不需要繁杂的 _w00_part0001 日志
+	// 默认开启简化日志（单文件、无分割），除非 STATS_SIMPLE_LOG=0
+	return envInt("STATS_SIMPLE_LOG", 1) == 1
+}
+
 func getStatsResultMaxBytes() int64 {
+	// 用户要求：固定目录，每20M一个日志
+	if isSimpleLog() {
+		return 20 * 1024 * 1024
+	}
 	// 结果文件最大体积（MB），默认 20MB
 	mb := envInt("STATS_RESULT_MAX_MB", 20)
 	if mb <= 0 {
@@ -241,6 +251,9 @@ func getStatsResultMaxBytes() int64 {
 }
 
 func getStatsResultWriterWorkers() int {
+	if isSimpleLog() {
+		return 1
+	}
 	n := envInt("STATS_RESULT_WRITER_WORKERS", 4)
 	if n <= 0 {
 		return 4
@@ -263,6 +276,18 @@ func makePartFilename(base string, workerID int, part int) string {
 	base = strings.TrimSpace(base)
 	if base == "" {
 		base = "results.jsonl"
+	}
+	if isSimpleLog() {
+		// 格式：res/日期-序号.ext (例如 res/2026-01-02-1.jsonl)
+		dir := "res"
+		_ = os.MkdirAll(dir, 0755)
+		date := time.Now().Format("2006-01-02")
+		ext := filepath.Ext(base)
+		if ext == "" {
+			ext = ".jsonl"
+		}
+		// 忽略 workerID (单 worker)
+		return filepath.Join(dir, fmt.Sprintf("%s-%d%s", date, part, ext))
 	}
 	ext := filepath.Ext(base)
 	name := strings.TrimSuffix(base, ext)
@@ -296,6 +321,9 @@ func (w *resultWorker) openForPart(part int) error {
 
 func NewResultWriter(filename string) (*ResultWriter, error) {
 	gz := getGzipCompressor()
+	if isSimpleLog() {
+		gz = nil // 简化模式不压缩
+	}
 	rw := &ResultWriter{
 		baseFilename: filename,
 		maxBytes:     getStatsResultMaxBytes(),
@@ -428,6 +456,9 @@ type ErrorWriter struct {
 
 func NewErrorWriter(filename string) (*ErrorWriter, error) {
 	gz := getGzipCompressor()
+	if isSimpleLog() {
+		gz = nil
+	}
 	ew := &ErrorWriter{
 		baseFilename: filename,
 		maxBytes:     getStatsErrorMaxBytes(),
@@ -494,6 +525,9 @@ func (ew *ErrorWriter) Dropped() int64 {
 }
 
 func getStatsErrorMaxBytes() int64 {
+	if isSimpleLog() {
+		return 20 * 1024 * 1024
+	}
 	// error.log 单文件最大体积（MB），默认 20MB
 	mb := envInt("STATS_ERROR_MAX_MB", 20)
 	if mb <= 0 {
@@ -503,6 +537,9 @@ func getStatsErrorMaxBytes() int64 {
 }
 
 func getStatsErrorWriterWorkers() int {
+	if isSimpleLog() {
+		return 1
+	}
 	n := envInt("STATS_ERROR_WRITER_WORKERS", 2)
 	if n <= 0 {
 		return 2
@@ -548,6 +585,21 @@ func makeErrorPartFilename(base string, workerID int, part int) string {
 	base = strings.TrimSpace(base)
 	if base == "" {
 		base = "error.log"
+	}
+	if isSimpleLog() {
+		dir := "res"
+		_ = os.MkdirAll(dir, 0755)
+		date := time.Now().Format("2006-01-02")
+		ext := filepath.Ext(base)
+		if ext == "" {
+			ext = ".log"
+		}
+		// 格式：res/日期-error-序号.log (区分 result 和 error)
+		// 注意：NewErrorWriter 传入的 base 通常是 error.log
+		// 我们希望文件名是 2026-01-02-error-1.log 还是 2026-01-02-1.log？
+		// 用户说 "以日期为文件名"，如果两个都叫 日期-1，会冲突。
+		// 所以 Error log 最好加个标记。
+		return filepath.Join(dir, fmt.Sprintf("%s-error-%d%s", date, part, ext))
 	}
 	ext := filepath.Ext(base)
 	name := strings.TrimSuffix(base, ext)
