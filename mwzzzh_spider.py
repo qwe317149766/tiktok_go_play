@@ -19,6 +19,37 @@ from curl_cffi.requests import AsyncSession
 from device_register.dgmain2.register_logic import run_registration_flow
 
 
+def _simple_load_env_file(path: str, override: bool = True) -> None:
+    """
+    轻量级 .env loader（作为 python-dotenv 的兜底）：
+    - 支持 KEY=VALUE
+    - 忽略空行 / # 注释
+    - 去掉首尾空白与一层引号（'...' 或 "..."）
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if not k:
+                    continue
+                # strip single/double quotes once
+                if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+                    v = v[1:-1]
+                if not override and k in os.environ:
+                    continue
+                os.environ[k] = v
+    except Exception:
+        # best-effort: 不影响主流程
+        return
+
+
 def _load_env_for_runtime() -> str | None:
     """
     为 mwzzzh_spider 载入环境配置：
@@ -32,7 +63,7 @@ def _load_env_for_runtime() -> str | None:
             from dotenv import load_dotenv  # type: ignore
             load_dotenv(explicit, override=True)
         except Exception:
-            pass
+            _simple_load_env_file(explicit, override=True)
         return explicit
 
     sysname = platform.system().lower()
@@ -67,6 +98,7 @@ def _load_env_for_runtime() -> str | None:
     try:
         from dotenv import load_dotenv  # type: ignore
     except Exception:
+        _simple_load_env_file(env_path, override=True)
         return env_path
 
     # 以文件为准，避免系统环境变量残留导致配置不生效
