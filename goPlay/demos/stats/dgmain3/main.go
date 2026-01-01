@@ -12,19 +12,20 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"runtime"
 )
 
 // ---------- rolling gzip compressor (best-effort, non-blocking) ----------
 
 type gzipCompressor struct {
-	enabled bool
-	q       chan string
-	wg      sync.WaitGroup
+	enabled   bool
+	q         chan string
+	wg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 var globalGzipOnce sync.Once
@@ -78,6 +79,14 @@ func getGzipCompressor() *gzipCompressor {
 }
 
 func (gc *gzipCompressor) Enqueue(path string) {
+	// 防止向已关闭的 channel 发送数据导致 panic
+	// 增加对 close 状态的判断（非绝对安全，但能过滤大部分）
+	defer func() {
+		if r := recover(); r != nil {
+			// ignore panic: send on closed channel
+		}
+	}()
+
 	if gc == nil || !gc.enabled {
 		return
 	}
@@ -99,8 +108,11 @@ func (gc *gzipCompressor) Close() {
 	if gc == nil || !gc.enabled {
 		return
 	}
-	close(gc.q)
-	gc.wg.Wait()
+	// 防止重复关闭 channel
+	gc.closeOnce.Do(func() {
+		close(gc.q)
+		gc.wg.Wait()
+	})
 }
 
 func gzipFileReplace(path string) error {
@@ -696,9 +708,9 @@ type Engine struct {
 	proxyManager  *ProxyManager
 	deviceManager *DeviceManager
 
-	success    int64
-	failed     int64
-	total      int64
+	success int64
+	failed  int64
+	total   int64
 	// inflight：正在执行中的任务数（用于减少达到目标后的“额外一轮并发”）
 	inflight   int64
 	errorStats ErrorStats
@@ -709,9 +721,9 @@ type Engine struct {
 	minConcurrency     int
 	maxConcurrency     int
 	// 趋势：用“和上一次对比”的成功率来决定是否允许降并发，以及何时升并发
-	lastAdjustTotal      int64
-	lastSuccessRate      float64
-	rateIncreaseStreak   int
+	lastAdjustTotal    int64
+	lastSuccessRate    float64
+	rateIncreaseStreak int
 
 	// 退出信号
 	stopChan chan struct{}
@@ -760,12 +772,12 @@ func NewEngine() (*Engine, error) {
 		deviceManager:      GetDeviceManager(),
 		bannedPoolIDs:      make(map[string]bool),
 		currentConcurrency: int64(config.MaxConcurrency),
-		minConcurrency:     minConc,                   // 最小并发数（=配置并发/2）
-		maxConcurrency:     maxConc,                   // 最大并发数（默认 2 倍初始值）
+		minConcurrency:     minConc, // 最小并发数（=配置并发/2）
+		maxConcurrency:     maxConc, // 最大并发数（默认 2 倍初始值）
 		lastAdjustTotal:    0,
 		lastSuccessRate:    -1,
 		rateIncreaseStreak: 0,
-		stopChan:           make(chan struct{}),       // 初始化stopChan
+		stopChan:           make(chan struct{}), // 初始化stopChan
 	}, nil
 }
 
@@ -1835,8 +1847,8 @@ func startCookieAutoRefillThread(maxConcurrency int) {
 	if checkInterval <= 0 {
 		checkInterval = 5
 	}
-	minThreshold := maxConcurrency * 2  // 最小阈值：2*并发数
-	targetCount := maxConcurrency * 3   // 目标数量：3*并发数
+	minThreshold := maxConcurrency * 2 // 最小阈值：2*并发数
+	targetCount := maxConcurrency * 3  // 目标数量：3*并发数
 
 	ticker := time.NewTicker(time.Duration(checkInterval) * time.Second)
 	defer ticker.Stop()
