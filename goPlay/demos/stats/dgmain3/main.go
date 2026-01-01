@@ -1710,7 +1710,14 @@ func main() {
 		config.MaxConcurrency = v
 	}
 
-	proxiesPath := findTopmostFileUpwards("proxies.txt", 8)
+	// 代理文件路径：优先从 env 读取，支持 STATS_PROXIES_FILE 单独配置
+	proxiesPath := strings.TrimSpace(envStr("STATS_PROXIES_FILE", ""))
+	if proxiesPath == "" {
+		proxiesPath = strings.TrimSpace(envStr("PROXIES_FILE", ""))
+	}
+	if proxiesPath == "" {
+		proxiesPath = findTopmostFileUpwards("proxies.txt", 8)
+	}
 	if proxiesPath == "" {
 		proxiesPath = "proxies.txt"
 	}
