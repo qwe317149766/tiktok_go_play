@@ -950,9 +950,32 @@ func (e *Engine) snapshotActivePoolIDsLocked() map[string]bool {
 	return out
 }
 
-// replaceBadDeviceIfNeeded：全 DB 模式不做“设备池补位”，只在本次运行内标记不健康并继续轮询。
+// replaceBadDeviceIfNeeded：检查设备健康状态，如果连续失败超过阈值则从 DB 中删除
 func (e *Engine) replaceBadDeviceIfNeeded(slot int, deviceJSON string, poolID string) {
-	return
+	if e.deviceManager == nil {
+		return
+	}
+
+	// 检查设备是否健康（连续失败 > 阈值）
+	if !e.deviceManager.IsHealthy(poolID) {
+		// 1. 统计
+		atomic.AddInt64(&e.evictedTotal, 1)
+		atomic.AddInt64(&e.evictedFail, 1)
+
+		// 2. 从数据库彻底删除
+		// 注意：全 DB 模式下，poolID 通常对应 device_key 或 device_id
+		if err := deleteDeviceFromDB(poolID); err != nil {
+			// 删除失败仅打印日志，不阻断流程
+			// log.Printf("❌ [Device-Evict] Failed to delete device %s: %v", poolID, err)
+		} else {
+			fmt.Printf("⚠️ [Device-Evict] 连续失败淘汰: %s (delete from DB)\n", poolID)
+		}
+
+		// 3. 本地内存标记封禁（防止本轮进程继续调度该设备）
+		e.bannedDeviceMu.Lock()
+		e.bannedPoolIDs[poolID] = true
+		e.bannedDeviceMu.Unlock()
+	}
 }
 
 func (e *Engine) replaceDevice(slot int, deviceJSON string, poolID string, reason string) {
