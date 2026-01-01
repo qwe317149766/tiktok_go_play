@@ -154,11 +154,11 @@ const adminHTML = `<!doctype html>
             <option value="overwrite">overwrite（全覆盖）</option>
           </select>
 
-          <label>设备文件（可选，优先于下方文本）</label>
+          <label>设备文件（可选；若选择文件，将优先使用文件内容）</label>
           <input name="devices_file" type="file" accept=".txt,.json,.jsonl,text/plain,application/json" />
 
           <label>设备 JSONL（每行一个 JSON）</label>
-          <textarea name="devices" placeholder='{"cdid":"...","create_time":"2025-12-31 01:11:00", ...}' required></textarea>
+          <textarea name="devices" placeholder='{"cdid":"...","create_time":"2025-12-31 01:11:00", ...}'></textarea>
 
           <button type="submit">导入到 Redis</button>
         </form>
@@ -183,11 +183,11 @@ const adminHTML = `<!doctype html>
             <option value="overwrite">overwrite（全覆盖）</option>
           </select>
 
-          <label>Cookies 文件（可选，优先于下方文本）</label>
+          <label>Cookies 文件（可选；若选择文件，将优先使用文件内容）</label>
           <input name="cookies_file" type="file" accept=".txt,.json,.jsonl,text/plain,application/json" />
 
           <label>Cookies（每行一条）</label>
-          <textarea name="cookies" placeholder='sessionid=...; sid_tt=...&#10;{"sessionid":"...","sid_tt":"..."}' required></textarea>
+          <textarea name="cookies" placeholder='sessionid=...; sid_tt=...&#10;{"sessionid":"...","sid_tt":"..."}'></textarea>
 
           <button type="submit">导入到 Redis</button>
         </form>
@@ -201,6 +201,14 @@ const adminHTML = `<!doctype html>
   </div>
 
 <script>
+function mustHaveFileOrText(formEl, fileName, textName) {
+  const fileEl = formEl.querySelector('input[name="' + fileName + '"]');
+  const textEl = formEl.querySelector('[name="' + textName + '"]');
+  const hasFile = !!(fileEl && fileEl.files && fileEl.files.length > 0);
+  const hasText = !!(textEl && (textEl.value || "").trim().length > 0);
+  return hasFile || hasText;
+}
+
 async function postForm(url, formEl) {
   const fd = new FormData(formEl);
   const resp = await fetch(url, { method: "POST", body: fd });
@@ -238,6 +246,10 @@ const devRemainHint = document.getElementById("devRemainHint");
 let devRemaining = "";
 devForm.addEventListener("submit", async (e) => {
   e.preventDefault();
+  if (!mustHaveFileOrText(devForm, "devices_file", "devices")) {
+    alert("请上传 devices_file 或在文本框粘贴设备 JSONL（至少提供一个）");
+    return;
+  }
   devOut.textContent = "loading...";
   devRemainHint.textContent = "";
   devRemaining = "";
@@ -273,6 +285,10 @@ const ckForm = document.getElementById("ckForm");
 const ckOut = document.getElementById("ckOut");
 ckForm.addEventListener("submit", async (e) => {
   e.preventDefault();
+  if (!mustHaveFileOrText(ckForm, "cookies_file", "cookies")) {
+    alert("请上传 cookies_file 或在文本框粘贴 cookies（至少提供一个）");
+    return;
+  }
   ckOut.textContent = "loading...";
   const r = await postForm("/admin/cookies/import", ckForm);
   ckOut.textContent = r.data ? JSON.stringify(r.data, null, 2) : r.text;
