@@ -41,8 +41,16 @@ func getenvInt(key string, def int) int {
 
 func loadConfig() Config {
 	// 按你要求：默认本地库 root/123456 tiktok_play
+	// API_ADDR 为空时：默认监听 0.0.0.0:8080（允许远程访问）
+	// 也可用 API_HOST / API_PORT 组合配置（更直观）
+	apiHost := getenv("API_HOST", "0.0.0.0")
+	apiPort := getenvInt("API_PORT", 8080)
+	apiAddrDefault := fmt.Sprintf("%s:%d", apiHost, apiPort)
+	if strings.TrimSpace(apiHost) == "" {
+		apiAddrDefault = fmt.Sprintf("0.0.0.0:%d", apiPort)
+	}
 	return Config{
-		Addr:   getenv("API_ADDR", ":8080"),
+		Addr:   getenv("API_ADDR", apiAddrDefault),
 
 		DBHost: getenv("DB_HOST", "127.0.0.1"),
 		DBPort: getenvInt("DB_PORT", 3306),

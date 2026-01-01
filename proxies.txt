@@ -1,1 +1,1 @@
-socks5h://accountId-6150-tunnelId-13689-area-any:moQ6TU@proxyus.starryproxy.com:10000
+socks5h://t5a52xfGa5mb-region-Random:aBaEHP3YR7pV@107.150.103.144:1000
