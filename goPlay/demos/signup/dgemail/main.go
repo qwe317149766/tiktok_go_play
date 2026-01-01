@@ -140,9 +140,27 @@ func main() {
 	}
 
 	// 3. 读取代理列表
-	proxyPath := findTopmostFileUpwards("proxies.txt", 8)
+	// 代理文件优先级（按你的需求：优先读取 dgemail 自己目录下的代理，而不是仓库根目录）
+	// - PROXIES_FILE（统一配置，推荐）
+	// - SIGNUP_PROXIES_FILE（signup 专用，兼容）
+	// - 当前目录 proxies.txt
+	// - 当前目录 data/proxies.txt（旧默认）
+	// - 最后兜底：向上查找仓库根目录 proxies.txt（兼容旧项目统一代理）
+	proxyPath := strings.TrimSpace(getEnvStr("PROXIES_FILE", ""))
 	if proxyPath == "" {
-		// 兼容旧目录结构
+		proxyPath = strings.TrimSpace(getEnvStr("SIGNUP_PROXIES_FILE", ""))
+	}
+	if proxyPath == "" && fileExists("proxies.txt") {
+		proxyPath = "proxies.txt"
+	}
+	if proxyPath == "" && fileExists("data/proxies.txt") {
+		proxyPath = "data/proxies.txt"
+	}
+	if proxyPath == "" {
+		proxyPath = findTopmostFileUpwards("proxies.txt", 8)
+	}
+	if proxyPath == "" {
+		// 最后再回退旧默认（理论上前面 fileExists 已覆盖）
 		proxyPath = "data/proxies.txt"
 	}
 	proxies, err := loadProxies(proxyPath)

@@ -55,6 +55,13 @@ http://proxy3:port
 
 > 说明：当前版本会优先读取“仓库根目录”的 `proxies.txt`（从当前目录向上查找，取最顶层那个），用于所有项目统一代理配置。
 
+更新（代理读取优先级已调整）：
+- 优先读取 **dgemail 自己目录下**的 `proxies.txt` 或 `data/proxies.txt`
+- 如需显式指定路径，可在 `env.linux/env.windows` 里配置：
+  - `PROXIES_FILE=/path/to/proxies.txt`（推荐）
+  - 或 `SIGNUP_PROXIES_FILE=/path/to/proxies.txt`
+- 只有当本地未找到时，才会兜底向上查找仓库根目录的 `proxies.txt`
+
 ### 2. 编译运行
 
 ```bash
