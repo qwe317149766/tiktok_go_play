@@ -11,8 +11,8 @@ import (
 )
 
 type Server struct {
-	cfg  Config
-	repo *Repo
+	cfg   Config
+	repo  *Repo
 	cache *APIKeyCache
 }
 
@@ -86,7 +86,14 @@ func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request, apiKey string
 		return
 	}
 
-	startCount := fetchStartCount(awemeID, link)
+	// Fetch real start count from TikTok
+	startCount, err := GetStartCount(awemeID)
+	if err != nil {
+		log.Printf("Failed to fetch start count for %s: %v", awemeID, err)
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "start_count not found"})
+		return
+	}
+	log.Printf("Fetched start count for %s: %d", awemeID, startCount)
 
 	ctx, cancel := withTimeout(r.Context())
 	defer cancel()
@@ -232,5 +239,3 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 		log.Printf("write json error: %v", err)
 	}
 }
-
-
