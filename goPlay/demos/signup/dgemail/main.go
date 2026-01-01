@@ -142,6 +142,9 @@ func main() {
 	}
 	fmt.Printf("已加载 %d 个代理\n", len(proxies))
 
+	// 初始化代理管理器（支持代理生成和使用次数限制）
+	InitProxyManager(proxies)
+
 	// 4. 设置并发数（降低并发以提高成功率）
 	maxConcurrency := getEnvInt("SIGNUP_CONCURRENCY", 50)
 	if maxConcurrency <= 0 {
@@ -382,16 +385,40 @@ func registerAccounts(accounts []AccountInfo, devices []map[string]interface{}, 
 			defer wg.Done()
 			defer func() { <-semaphore }() // 释放信号量
 
-			// 选择设备和代理（轮询方式）
+			// 选择设备（轮询方式）
 			deviceIdx := int(atomic.AddInt64(&deviceIndex, 1)-1) % len(devices)
-			proxyIdx := int(atomic.AddInt64(&proxyIndex, 1)-1) % len(proxies)
-
 			deviceRaw := devices[deviceIdx]
 			device := convertDeviceToStringMap(deviceRaw) // 转换为字符串map用于注册
-			proxy := proxies[proxyIdx]
+
+			// 选择代理（使用代理管理器，支持代理生成和使用次数限制）
+			var proxy string
+			var shouldRecordProxyUse bool
+			if proxyManager := GetProxyManager(); proxyManager != nil {
+				proxy = proxyManager.GetNextProxy()
+				if proxy == "" {
+					// 降级到原始代理列表
+					proxyIdx := int(atomic.AddInt64(&proxyIndex, 1)-1) % len(proxies)
+					proxy = proxies[proxyIdx]
+					shouldRecordProxyUse = false // 原始代理列表不使用代理管理器记录
+				} else {
+					shouldRecordProxyUse = true // 使用代理管理器生成的代理，需要记录
+				}
+			} else {
+				// 降级到原始代理列表
+				proxyIdx := int(atomic.AddInt64(&proxyIndex, 1)-1) % len(proxies)
+				proxy = proxies[proxyIdx]
+				shouldRecordProxyUse = false
+			}
 
 			// 执行注册
 			result := registerSingleAccount(acc, device, proxy, idx+1, len(accounts))
+
+			// 记录代理使用（无论成功或失败都算使用）
+			if shouldRecordProxyUse {
+				if proxyManager := GetProxyManager(); proxyManager != nil {
+					proxyManager.RecordProxyUse(proxy)
+				}
+			}
 
 			// 更新统计
 			atomic.AddInt64(&totalCount, 1)

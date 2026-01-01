@@ -1438,11 +1438,60 @@ func (e *Engine) Run() {
 				}
 				curConc := atomic.LoadInt64(&e.currentConcurrency)
 
+				// 生成失败原因摘要
+				failReasonSummary := ""
+				if failed > 0 {
+					parts := []string{}
+					if seedErr > 0 {
+						parts = append(parts, fmt.Sprintf("seed=%d", seedErr))
+					}
+					if tokenErr > 0 {
+						parts = append(parts, fmt.Sprintf("token=%d", tokenErr))
+					}
+					if statsErr > 0 {
+						parts = append(parts, fmt.Sprintf("stats=%d", statsErr))
+					}
+					if networkErr > 0 {
+						parts = append(parts, fmt.Sprintf("network=%d", networkErr))
+					}
+					if parseErr > 0 {
+						parts = append(parts, fmt.Sprintf("parse=%d", parseErr))
+					}
+					if tmoErr > 0 {
+						parts = append(parts, fmt.Sprintf("timeout=%d", tmoErr))
+					}
+					if h403 > 0 {
+						parts = append(parts, fmt.Sprintf("http403=%d", h403))
+					}
+					if h429 > 0 {
+						parts = append(parts, fmt.Sprintf("http429=%d", h429))
+					}
+					if h5xx > 0 {
+						parts = append(parts, fmt.Sprintf("http5xx=%d", h5xx))
+					}
+					if capErr > 0 {
+						parts = append(parts, fmt.Sprintf("captcha=%d", capErr))
+					}
+					if emptyErr > 0 {
+						parts = append(parts, fmt.Sprintf("empty=%d", emptyErr))
+					}
+					if otherErr > 0 {
+						parts = append(parts, fmt.Sprintf("other=%d", otherErr))
+					}
+					if len(parts) > 0 {
+						failReasonSummary = " | 失败原因: " + strings.Join(parts, ", ")
+					}
+					// 如果所有失败都在seed阶段，添加提示
+					if seedErr > 0 && seedErr == failed {
+						failReasonSummary += " (所有失败都在seed阶段，详细错误请查看error.log文件)"
+					}
+				}
+
 				log.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%% | 错误分类: seed=%d, token=%d, stats=%d, network=%d, parse=%d, other=%d, timeout=%d, http403=%d, http429=%d, http5xx=%d, captcha=%d, empty=%d | 设备淘汰: total=%d (fail=%d, play=%d) banned=%d | Cookies更换: total=%d banned=%d | 并发(动态)=%d/%d | 写入丢弃: results=%d error=%d",
 					success, failed, total, rate, seedErr, tokenErr, statsErr, networkErr, parseErr, otherErr, tmoErr, h403, h429, h5xx, capErr, emptyErr,
 					evAll, evFail, evPlay, bannedN, ckRepl, ckBanned, curConc, int64(e.maxConcurrency), dropRes, dropErr)
 				// 兜底：确保进度一定打印到 stdout（避免 log 输出被重定向/吞掉）
-				fmt.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%%\n", success, failed, total, rate)
+				fmt.Printf("[进度] 成功=%d, 失败=%d, 总数=%d, 成功率=%.2f%%%s\n", success, failed, total, rate, failReasonSummary)
 				// 动态调整并发数
 				e.adjustConcurrency()
 

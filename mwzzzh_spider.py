@@ -11,9 +11,11 @@ import signal
 from datetime import datetime
 from itertools import cycle
 from concurrent.futures import ThreadPoolExecutor
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse, urlunparse
+import threading
 
 # 你的核心请求库
 from curl_cffi.requests import AsyncSession
@@ -772,10 +774,150 @@ class SessionPool:
             self.q.put_nowait(h)
 
 
+# ================= 5. 代理管理器 =================
+class ProxyTemplate:
+    """代理模板（用于生成多个连接）"""
+    def __init__(self, original_url: str, scheme: str, host: str, port: str, username: str, password: str):
+        self.original_url = original_url
+        self.scheme = scheme
+        self.host = host
+        self.port = port
+        self.username = username  # 基础用户名（不含连接ID部分）
+        self.password = password
+        self.conn_counter = 0
+        self.lock = threading.Lock()
+    
+    def generate_proxy(self, conn_id: int) -> str:
+        """从模板生成带连接ID的代理URL"""
+        username = f"{self.username}-conn-{conn_id}"
+        return f"{self.scheme}://{username}:{self.password}@{self.host}:{self.port}"
+
+
+class ProxyManager:
+    """代理管理器，支持代理模板解析和预生成"""
+    def __init__(self, proxies: List[str], max_concurrency: int):
+        self.proxies: List[str] = []  # 普通代理列表
+        self.templates: List[ProxyTemplate] = []  # 代理模板列表
+        self.generated: List[str] = []  # 预生成的代理列表
+        self.generated_index = 0
+        self.lock = threading.Lock()
+        
+        # 解析代理，生成模板
+        should_generate_conn_id = not _parse_bool(os.getenv("PROXY_NO_GENERATE_CONN_ID"), False) and \
+                                  not _parse_bool(os.getenv("GEN_PROXY_NO_GENERATE_CONN_ID"), False)
+        
+        for proxy in proxies:
+            template = self._parse_proxy_template(proxy)
+            if template and should_generate_conn_id:
+                self.templates.append(template)
+            else:
+                self.proxies.append(proxy)
+        
+        # 预生成代理链接
+        self._pre_generate_proxies(max_concurrency)
+    
+    def _parse_proxy_template(self, proxy_url: str) -> Optional[ProxyTemplate]:
+        """解析代理URL，提取模板信息"""
+        try:
+            parsed = urlparse(proxy_url)
+            if not parsed.scheme or not parsed.hostname:
+                return None
+            
+            username = parsed.username or ""
+            password = parsed.password or ""
+            port = parsed.port or ("1080" if parsed.scheme.startswith("socks") else "8080")
+            
+            # 提取基础用户名（去掉可能的连接ID后缀）
+            if "-conn-" in username:
+                username = username.split("-conn-")[0]
+            
+            return ProxyTemplate(
+                original_url=proxy_url,
+                scheme=parsed.scheme,
+                host=parsed.hostname,
+                port=str(port),
+                username=username,
+                password=password
+            )
+        except Exception:
+            return None
+    
+    def _pre_generate_proxies(self, max_concurrency: int):
+        """预生成代理链接（根据并发数提前生成，例如1000并发生成2000个代理链接）"""
+        if not self.templates:
+            return
+        
+        # 计算需要生成的代理数量：并发数 * 2
+        # 可以通过环境变量 GEN_PROXY_PREGEN_MULTIPLIER 自定义倍数，默认为2
+        multiplier = _get_int_from_env("GEN_PROXY_PREGEN_MULTIPLIER", default=2)
+        if multiplier <= 0:
+            multiplier = 2
+        target_count = max_concurrency * multiplier
+        
+        # 计算每个模板需要生成的代理数量
+        proxies_per_template = target_count // len(self.templates)
+        if proxies_per_template <= 0:
+            proxies_per_template = 1
+        
+        # 为每个模板预生成代理链接
+        total_generated = 0
+        for template in self.templates:
+            for i in range(proxies_per_template):
+                with template.lock:
+                    template.conn_counter += 1
+                    conn_id = template.conn_counter
+                gen_proxy = template.generate_proxy(conn_id)
+                self.generated.append(gen_proxy)
+                total_generated += 1
+        
+        # 如果还有余数，再为前几个模板各生成一个
+        remainder = target_count % len(self.templates)
+        for i in range(remainder):
+            if i < len(self.templates):
+                template = self.templates[i]
+                with template.lock:
+                    template.conn_counter += 1
+                    conn_id = template.conn_counter
+                gen_proxy = template.generate_proxy(conn_id)
+                self.generated.append(gen_proxy)
+                total_generated += 1
+        
+        logger.info(
+            f"已预生成 {total_generated} 个代理链接（并发数: {max_concurrency}, 倍数: {multiplier}, 模板数: {len(self.templates)}）"
+        )
+    
+    def get_next_proxy(self) -> str:
+        """获取下一个代理（优先使用预生成的代理）"""
+        # 优先使用预生成的代理
+        if self.generated:
+            with self.lock:
+                proxy = self.generated[self.generated_index % len(self.generated)]
+                self.generated_index += 1
+                return proxy
+        
+        # 降级到普通代理
+        if self.proxies:
+            with self.lock:
+                proxy = self.proxies[self.generated_index % len(self.proxies)]
+                self.generated_index += 1
+                return proxy
+        
+        # 如果都没有，尝试从模板实时生成
+        if self.templates:
+            template = self.templates[self.generated_index % len(self.templates)]
+            with template.lock:
+                template.conn_counter += 1
+                conn_id = template.conn_counter
+            return template.generate_proxy(conn_id)
+        
+        return ""
+
+
 # ================= 6. 引擎 =================
 class SpiderEngine:
     def __init__(self):
-        self.proxy_cycle = cycle(Config.PROXIES)
+        # 初始化代理管理器（支持代理生成和预生成）
+        self.proxy_manager = ProxyManager(Config.PROXIES, Config.MAX_CONCURRENCY)
         backend = Config.DEVICE_POOL_BACKEND
         if backend not in {"db", "mysql"}:
             logger.critical(f"[cfg] DEVICE_POOL_BACKEND={backend} 不支持（已移除 Redis），请设置为 db/mysql")
@@ -810,7 +952,7 @@ class SpiderEngine:
             logger.info(f"[keepalive] enabled pool_size={self.session_pool.size} max_requests={Config.SESSION_MAX_REQUESTS} impersonate={Config.IMPERSONATE}")
 
     def get_proxy(self):
-        return next(self.proxy_cycle)
+        return self.proxy_manager.get_next_proxy()
 
     async def _worker_wrapper(self, task_id, task_params):
         async with self.sem:

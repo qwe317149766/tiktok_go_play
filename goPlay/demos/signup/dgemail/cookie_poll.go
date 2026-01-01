@@ -124,6 +124,9 @@ func runCookiePollLoop() {
 	}
 	log.Printf("[poll] 已加载 %d 个代理", len(proxies))
 
+	// 初始化代理管理器（支持代理生成和使用次数限制）
+	InitProxyManager(proxies)
+
 	maxConcurrency := getEnvInt("SIGNUP_CONCURRENCY", 50)
 	if maxConcurrency <= 0 {
 		maxConcurrency = 50
