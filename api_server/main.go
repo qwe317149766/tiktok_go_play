@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"net/http"
 	"os"
@@ -11,6 +12,13 @@ import (
 )
 
 func main() {
+	// 命令行参数
+	cliConfig := flag.String("config", "", "指定配置文件路径")
+	flag.Parse()
+	if *cliConfig != "" {
+		os.Setenv("ENV_FILE", *cliConfig)
+	}
+
 	loadEnv()
 	cfg := loadConfig()
 
@@ -59,5 +67,3 @@ func main() {
 	defer cancel()
 	_ = httpSrv.Shutdown(ctx)
 }
-
-
