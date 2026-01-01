@@ -388,6 +388,10 @@ class Config:
     # - 默认开启（保持兼容）
     # - 如果你不需要 results 文件，设置 MWZZZH_SAVE_RESULTS_FILE=0 可避免打开该文件
     SAVE_RESULTS_FILE = _parse_bool(os.getenv("MWZZZH_SAVE_RESULTS_FILE"), True)
+    # results 写入失败是否视为致命错误：
+    # - 默认 False：results 只是辅助日志，不应影响 Redis 入库
+    # - 如需强一致（results 必须落盘），可设置 MWZZZH_RESULTS_FATAL=1
+    RESULTS_FATAL = _parse_bool(os.getenv("MWZZZH_RESULTS_FATAL"), False)
 
     # 是否保存“注册成功设备”到 Redis
     SAVE_TO_REDIS = _parse_bool(os.getenv("SAVE_TO_REDIS"), False)
@@ -556,7 +560,23 @@ class DataPipeline:
         await self.queue.put((shard_key, data))
 
     def _write_impl(self, batch):
-        # 1) 写 results 文件（可选）
+        # ⚠️ 关键：按你的要求，顺序调整为 “先写 Redis，再写文件”
+        #
+        # 0) 同步写入 Redis（最重要；先做，保证入库优先）
+        if self.redis_pool is not None:
+            only_devices = [d for _, d in batch]
+            _, evicted = self.redis_pool.add_devices(only_devices)
+            if evicted:
+                logger.info(f"[redis] 设备池已满，已淘汰 {evicted} 条（按 use_count 最大）")
+
+        # 1) 同步写入本地备份文件（可选）
+        try:
+            self._write_devices_to_backup_files(batch)
+        except Exception as e:
+            logger.critical(f"[file] 致命：写入本地备份失败: {e}")
+            raise
+
+        # 2) 写 results 文件（可选；最后做，避免影响 Redis）
         if self.save_results_file:
             try:
                 with open(self.filename, 'a', encoding='utf-8') as f:
@@ -564,26 +584,10 @@ class DataPipeline:
                         line = json.dumps(item, ensure_ascii=False)
                         f.write(line + "\n")
             except Exception as e:
-                logger.error(f"写入失败: {e}")
-                # results 文件都写不进去时，直接抛给上层（让线程退出）
-                raise
-
-        # 同步写入本地备份文件（在 executor 线程中执行）
-        try:
-            self._write_devices_to_backup_files(batch)
-        except Exception as e:
-            logger.critical(f"[file] 致命：写入本地备份失败: {e}")
-            # 备份打开时：视为致命，避免“跑了但没落地”
-            raise
-
-        # 同步写入 Redis（在 executor 线程中执行，不阻塞 event loop）
-        if self.redis_pool is not None:
-            # Redis 打开时：任何写入失败都应该终止程序（避免“跑了但没入库”）
-            only_devices = [d for _, d in batch]
-            _, evicted = self.redis_pool.add_devices(only_devices)
-            if evicted:
-                # 不刷屏，只在发生淘汰时提示一次
-                logger.info(f"[redis] 设备池已满，已淘汰 {evicted} 条（按 use_count 最大）")
+                # 默认不致命：results 只是辅助日志；不要因为它阻塞 Redis 入库
+                logger.error(f"[results] 写入失败（已忽略）: {e}")
+                if Config.RESULTS_FATAL:
+                    raise
 
     async def _consumer(self):
         batch: list[tuple[int | None, Dict[str, Any]]] = []
