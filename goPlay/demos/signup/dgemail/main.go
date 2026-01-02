@@ -165,6 +165,7 @@ func main() {
 	// 命令行参数支持
 	cliConfig := flag.String("config", "", "指定配置文件路径 (e.g. -config env.linux)")
 	cliProxy := flag.String("proxy", "", "指定代理文件路径 (e.g. -proxy proxies.txt)")
+	cliDevices := flag.String("devices", "", "指定设备文件路径 (e.g. -devices devices.txt)")
 	flag.Parse()
 
 	if *cliConfig != "" {
@@ -200,8 +201,25 @@ func main() {
 
 	// 2. 读取设备列表
 	var devices []map[string]interface{}
-	// 全 DB 模式：signup 设备固定从 MySQL 设备池读取
-	if shouldLoadDevicesFromDB() {
+	source := strings.ToLower(strings.TrimSpace(getEnvStr("SIGNUP_DEVICES_SOURCE", "db")))
+	if cliDevices != nil && *cliDevices != "" {
+		source = "file"
+	}
+
+	if source == "file" {
+		devicePath := ""
+		if cliDevices != nil && *cliDevices != "" {
+			devicePath = *cliDevices
+		}
+		if devicePath == "" {
+			devicePath = getEnvStr("SIGNUP_DEVICES_FILE", "devices.txt")
+		}
+		devices, err = loadDevices(devicePath)
+		if err != nil {
+			log.Fatalf("从文件读取设备失败 (%s): %v", devicePath, err)
+		}
+		fmt.Printf("已从文件加载 %d 个设备: %s\n", len(devices), devicePath)
+	} else if shouldLoadDevicesFromDB() {
 		limit := getEnvInt("DEVICES_LIMIT", getEnvInt("MAX_GENERATE", 0))
 		devices, err = loadDevicesFromDB(limit)
 		if err != nil {
@@ -209,10 +227,7 @@ func main() {
 		}
 		fmt.Printf("已从MySQL加载 %d 个设备\n", len(devices))
 	} else {
-		log.Fatalf("SIGNUP_DEVICES_SOURCE 未配置为 db/mysql：当前版本已移除 file/redis 设备来源，请设置 SIGNUP_DEVICES_SOURCE=db")
-	}
-	if err != nil {
-		log.Fatalf("读取设备列表失败: %v", err)
+		log.Fatalf("SIGNUP_DEVICES_SOURCE 配置错误：%s。可选值：db, file", source)
 	}
 
 	// DB 模式：在 loadDevicesFromDB 内已做筛选；这里补一句可观测日志

@@ -67,12 +67,13 @@ func shouldLoadCookiesFromDB() bool {
 
 func defaultCookieFromEnv() (CookieRecord, bool, error) {
 	// DEFAULT_COOKIES_JSON 格式：{"sessionid":"...","sid_tt":"...","uid_tt":"...", ...}
+	// 或 Python dict: {'sessionid':'...', ...}
 	raw := strings.TrimSpace(os.Getenv("DEFAULT_COOKIES_JSON"))
 	if raw == "" {
 		return CookieRecord{}, false, nil
 	}
-	var ck map[string]string
-	if err := json.Unmarshal([]byte(raw), &ck); err != nil || len(ck) == 0 {
+	ck := parseCookiesAny(raw)
+	if len(ck) == 0 {
 		return CookieRecord{}, false, fmt.Errorf("DEFAULT_COOKIES_JSON 解析失败或为空")
 	}
 	return CookieRecord{ID: "default", Cookies: ck}, true, nil
@@ -148,8 +149,8 @@ func parseCookiesAny(v any) map[string]string {
 				return parseCookiesAny(m2)
 			}
 		}
-		// Python dict string
-		if strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}") && strings.Contains(s, "':") {
+		// Python dict string (flexible check for single quotes)
+		if strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}") && strings.Contains(s, "'") {
 			matches := rePyCookiePair.FindAllStringSubmatch(s, -1)
 			if len(matches) == 0 {
 				return nil
@@ -253,5 +254,3 @@ func loadCookiesFromStartupDevices(lines []string, limit int) []CookieRecord {
 	}
 	return out
 }
-
-

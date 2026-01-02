@@ -1340,7 +1340,7 @@ func executeTask(taskID int, awemeID, deviceJSON, proxy string) (bool, map[strin
 	return success, result
 }
 
-func (e *Engine) taskWrapper(taskID int) {
+func (e *Engine) taskWrapper(taskID int, workerID int) {
 	// 添加panic恢复，防止程序崩溃
 	defer func() {
 		if r := recover(); r != nil {
@@ -1611,7 +1611,7 @@ func (e *Engine) Run() {
 	// 使用worker pool模式：启动到并发上限，让 currentConcurrency 真正可以“向上扩容/向下收缩”
 	for i := 0; i < e.maxConcurrency; i++ {
 		wg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer wg.Done()
 			for {
 				// 检查退出信号
@@ -1634,9 +1634,9 @@ func (e *Engine) Run() {
 				}
 
 				id := int(atomic.AddInt64(&taskID, 1))
-				e.taskWrapper(id)
+				e.taskWrapper(id, workerID)
 			}
-		}()
+		}(i)
 	}
 
 	wg.Wait()
