@@ -30,7 +30,8 @@ if %ERRORLEVEL% NEQ 0 (
 )
 
 echo.
-echo [1/2] Building Stats (dgmain3)...
+echo [1/4] Building Stats (dgmain3)...
+
 :: Navigate directly to source directory
 if exist "goPlay\demos\stats\dgmain3" (
     cd "goPlay\demos\stats\dgmain3"
@@ -52,7 +53,8 @@ if %ERRORLEVEL% NEQ 0 (
 echo ✅ Success.
 
 echo.
-echo [2/2] Building Signup (dgemail)...
+echo [2/4] Building Signup (dgemail)...
+
 cd "%ROOT_DIR%"
 if exist "goPlay\demos\signup\dgemail" (
     cd "goPlay\demos\signup\dgemail"
@@ -74,7 +76,8 @@ if %ERRORLEVEL% NEQ 0 (
 echo ✅ Success.
 
 echo.
-echo [3/3] Building API Server (api_server)...
+echo [3/4] Building API Server (api_server)...
+
 cd "%ROOT_DIR%"
 if exist "api_server" (
     cd "api_server"
@@ -96,9 +99,27 @@ if %ERRORLEVEL% NEQ 0 (
 echo ✅ Success.
 
 echo.
+echo [4/4] Building Stats-V2 (Go Refactor)...
+cd "%ROOT_DIR%"
+if exist "goPlay\demos\stats-v2-go" (
+    cd "goPlay\demos\stats-v2-go"
+) else (
+    echo ❌ Source directory 'goPlay\demos\stats-v2-go' not found!
+    pause
+    exit /b 1
+)
 
+echo Current Dir: !cd!
+echo Compiling...
+go build -ldflags "-s -w" -o "%BIN_DIR%\stats-v2_linux" .
+if %ERRORLEVEL% NEQ 0 (
+    echo ❌ Stats-V2 build failed!
+    cd "%ROOT_DIR%"
+    pause
+    exit /b %ERRORLEVEL%
+)
+echo ✅ Success.
 
-echo.
 echo ==========================================
 echo All builds completed successfully!
 echo Binaries: %BIN_DIR%
