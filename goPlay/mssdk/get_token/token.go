@@ -145,10 +145,12 @@ func GetGetToken(cookieData map[string]string, proxy string, client ...*http.Cli
 
 // createClient 创建HTTP客户端（原有逻辑）
 func createClient(proxy string) *http.Client {
-	var transport *http.Transport
+	client := &http.Client{
+		Timeout: 25 * time.Second,
+	}
 	if proxy != "" {
 		if proxyURL, err := url.Parse(proxy); err == nil {
-			transport = &http.Transport{
+			client.Transport = &http.Transport{
 				Proxy:                 http.ProxyURL(proxyURL),
 				MaxIdleConns:          100,
 				MaxIdleConnsPerHost:   20,
@@ -161,25 +163,7 @@ func createClient(proxy string) *http.Client {
 			}
 		}
 	}
-	if transport == nil {
-		if proxyURL, err := url.Parse("http://127.0.0.1:7777"); err == nil {
-			transport = &http.Transport{
-				Proxy:                 http.ProxyURL(proxyURL),
-				MaxIdleConns:          100,
-				MaxIdleConnsPerHost:   20,
-				MaxConnsPerHost:       30,
-				IdleConnTimeout:       60 * time.Second,
-				TLSHandshakeTimeout:   8 * time.Second,
-				ResponseHeaderTimeout: 15 * time.Second,
-				DisableKeepAlives:     false,
-				ForceAttemptHTTP2:     false,
-			}
-		}
-	}
-	return &http.Client{
-		Timeout:   25 * time.Second,
-		Transport: transport,
-	}
+	return client
 }
 
 // func main() {
