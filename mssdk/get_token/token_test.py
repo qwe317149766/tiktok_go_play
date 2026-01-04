@@ -476,10 +476,19 @@ def get_get_token(cookie_data:dict, proxy="", http_client=None, session=None):
     ua = cookie_data["ua"]
     iid = cookie_data["install_id"]
     device_id = cookie_data["device_id"]
-    # sender_id = cookie_data["uid"]
-    # 1. Use the full URL with all parameters to prevent auto-encoding issues
-    # that would invalidate the request signatures.
-    url = f"https://mssdk16-normal-useast5.tiktokv.us/sdi/get_token?lc_id=2142840551&platform=android&device_platform=android&sdk_ver=v05.02.02-alpha.12-ov-android&sdk_ver_code=84017696&app_ver=42.4.3&version_code=2024204030&aid=1233&sdkid&subaid&iid={iid}&did={device_id}&bd_did&client_type=inhouse&region_type=ov&mode=2"
+    
+    # 根据地区选择域名
+    region = cookie_data.get("store-country-code", "us").lower()
+    if region == "us":
+        domain = "mssdk16-normal-useast5.tiktokv.us"
+    else:
+        domain = "mssdk16-normal-alisg.tiktokv.com"
+        
+    version_name = cookie_data.get("version_name", "42.4.3")
+    version_code = cookie_data.get("version_code", "420403")
+    update_version_code = cookie_data.get("update_version_code", "2024204030")
+
+    url = f"https://{domain}/sdi/get_token?lc_id=2142840551&platform=android&device_platform=android&sdk_ver=v05.02.02-alpha.12-ov-android&sdk_ver_code=84017696&app_ver={version_name}&version_code={update_version_code}&aid=1233&sdkid&subaid&iid={iid}&did={device_id}&bd_did&client_type=inhouse&region_type=ov&mode=2"
 
     # session = "a930300ef0f5bad045b1d824bcb6a98e"   # 这个session的逻辑需要再确定一下，其他的都没什么问题的
     # session= str(uuid.uuid4()).replace("-", "")
@@ -523,7 +532,8 @@ def get_get_token(cookie_data:dict, proxy="", http_client=None, session=None):
     #     'mode': '2',
     # }
     # query_string = urllib.parse.urlencode(params)
-    query_string = f"lc_id=2142840551&platform=android&device_platform=android&sdk_ver=v05.02.02-alpha.12-ov-android&sdk_ver_code=84017696&app_ver=42.4.3&version_code=2024204030&aid=1233&sdkid&subaid&iid={iid}&did={device_id}&bd_did&client_type=inhouse&region_type=ov&mode=2"
+    query_string = f"lc_id=2142840551&platform=android&device_platform=android&sdk_ver=v05.02.02-alpha.12-ov-android&sdk_ver_code=84017696&app_ver={version_name}&version_code={update_version_code}&aid=1233&sdkid&subaid&iid={iid}&did={device_id}&bd_did&client_type=inhouse&region_type=ov&mode=2"
+    
     # print("query_string ===> ",query_string)
     # query_string 来自于params
     x_ss_stub,x_khronos,x_argus,x_ladon,x_gorgon = make_headers.make_headers(device_id,stime,
@@ -533,8 +543,13 @@ def get_get_token(cookie_data:dict, proxy="", http_client=None, session=None):
                                                                              f"{query_string}",
                                                                              post_data)
 
-
-
+    # 根据地区选择 region 字符串和 persist region
+    store_region = cookie_data.get("store-country-code", "us").lower()
+    if store_region == "us":
+        persist_region = "US|6252001|5332921"
+    else:
+        # 如果不是美国，使用对应大区的 persist region
+        persist_region = f"{store_region.upper()}|1835841|1843561"
 
     # 3. Define the Headers
     headers = [
@@ -542,37 +557,29 @@ def get_get_token(cookie_data:dict, proxy="", http_client=None, session=None):
         ('rpc-persist-pyxis-policy-state-law-is-ca', '1'),
         ('X-SS-STUB', f'{x_ss_stub}'),
         ('Accept-Encoding', 'gzip'),
-        ('rpc-persist-pns-region-3', 'US|6252001|5332921'),
+        ('rpc-persist-pns-region-3', persist_region),
         ('x-tt-request-tag', 'n=0;nr=111;bg=0;t=0'),
-        ('rpc-persist-pns-region-2', 'US|6252001|5332921'),
-        ('rpc-persist-pns-region-1', 'US|6252001|5332921'),
+        ('rpc-persist-pns-region-2', persist_region),
+        ('rpc-persist-pns-region-1', persist_region),
         ('x-tt-pba-enable', '1'),
         ('Accept', '*/*'),
         ('x-bd-kmsv', '0'),
         ('X-SS-REQ-TICKET', f'{utime}'),
-        # ('x-bd-client-key', '#7XhgXG1xPDHCI3vftue5QnEDqKXYPbJp6uwMo9cxiO9OcRvy+Qp3rOun1iYALEujE/vC2OAuGh0vj5qS'),
         ('x-vc-bdturing-sdk-version', '2.3.13.i18n'),
         ('oec-vc-sdk-version', '3.0.12.i18n'),
         ('sdk-version', '2'),
         ('x-tt-dm-status', 'login=1;ct=1;rt=8'),
-        # ('X-Tt-Token',
-        #  x_tt_token),
         ('passport-sdk-version', '-1'),
-        ('x-tt-store-region', 'us'),
+        ('x-tt-store-region', store_region),
         ('x-tt-store-region-src', 'uid'),
-        ('User-Agent',
-         ua),
+        ('User-Agent', ua),
         ('X-Ladon', f'{x_ladon}'),
         ('X-Khronos', f'{stime}'),
-        ('X-Argus',
-         f'{x_argus}'),
+        ('X-Argus', f'{x_argus}'),
         ('X-Gorgon', f'{x_gorgon}'),
         ('Content-Type', 'application/octet-stream'),
-        ('Host', 'mssdk16-normal-useast5.tiktokv.us'),
+        ('Host', domain),
         ('Connection', 'Keep-Alive'),
-        # The full Cookie string is included as a header to ensure its format is identical to the raw request.
-        # ('Cookie',
-        #  f'store-idc=useast5; store-country-code=us; install_id={iid}; ttreq={ttreq}; passport_csrf_token={passport_csrf_token}; passport_csrf_token_default={passport_csrf_token}; store-country-code-src=uid; multi_sids={multi_sids}; cmpl_token={cmpl_token}; d_ticket={d_ticket}; sid_guard={sid_guard}; uid_tt={uid_tt}; uid_tt_ss={uid_tt}; sid_tt={sessionid}; sessionid={sessionid}; sessionid_ss={sessionid}; tt_session_tlb_tag=sttt%7C5%7CDQp2JeFvbsRVd066xKPLJP________-5NWxRwFjRS8rZNh5mBfI6XbTiVUUkftEYH0ToFGFa3-c%3D; tt-target-idc=useast5; tt_ticket_guard_has_set_public_key=1; store-country-sign={store_country_sign}; msToken={msToken}; odin_tt={odin_tt}'),
     ]
 
     # 4. Define the POST body (payload)
