@@ -1,0 +1,97 @@
+
+Header:
+Vary: Accept-Encoding
+X-Tt-App-Cdn-Region: jp
+X-Akamai-Request-Id: 166ef965
+Content-Type: application/json
+X-Tt-Logid: 20260103153837C2E77B1970C091952600
+To-Env: 
+X-Tt-Trace-Id: 00-260103153837C2E77B1970C091952600-3C619DD48F6B35BE-00
+Expires: Sat, 03 Jan 2026 07:38:37 GMT
+X-Tt-Store-Region: jp
+X-Tt-Store-Region-Src: did
+X-Tt-Tnc-Config: epoch:574758|cond_label:136706,232457,257104,257117,257170,257171,257283,257770,2361020,2361021,257097,257103,257209,257562,257720,257797,2320020,2324282,2328360,3079584,3079585,3079586,3079590,3079591,3079592,3079593,3079594,3079595,3079596,3079597,3079598,2324289,2328423,2326839,2315461,3111825,3111826,2997848,2997849,2320288,2320561,2323354,2323624,2324469,2324731,2325227,2325489,2320295,2320568,2324473,2324735,2325231,2325493,2323359,2323629,2324481,2324743,2325240,2325502,2320572,2323636|dispatch:257068,257069,257106,257107,257175,257176,257177,257178,257179,257180,257200,257201,257247,257248,257301,257477,257714,257761,257765,257790,257791,2315454,2315466,2320017,2320022,2320044,2320113,2320167,2320234,2323175,2323230,2323299,2323903,2324092,2324272,2324343,2324429,2325041,2325086,2325180,2325896,2326804,2326830,2361019,2361022,2361023,2361024,2447913,2447922,2972358,2994173,2994174,2994175,2994177,2994178,3012245,3050157,3050184|new_common:257636,257637,257648,257649,257654,257655,257656,257667,257670,257683,257685,257727,257728,257729,257731,257732,257747,257823,257826,257827,257835,259080,367000,367001,367044,367054,367066,367091,367092,367096,367110,367144,367146,367149,367160,367179,367182,367185,367186,367187,367188,367193,367194,367196,367202,367203,367218,439991,1252466,1252522,1252524,1252528,1252535,1252536,1252537,1252594,1252601,1252611,1252612,1252614,1252618,1252697,1252725,1541550,1609109,1609500,1612758,2201460,2203754,2328366,2748689,2964745,2968267,2972198,2994181,3000087,3000088,3000089,3000091,3000095,3005661,3007778,3007779,3015809,3031217,3098128,3111273,3111274,3111276,257657,366985,367111,367118,1252711,1600378,3015807,257687,367134,367168,809690,809691,809693,809706,1252490,1252553,1252564,1252626,1252627,1252635,1252741|
+X-Tt-With-Tnc: 1
+Server-Timing: inner; dur=137, cdn-cache; desc=MISS, edge; dur=3, origin; dur=219
+Pragma: no-cache
+X-Cache: TCP_MISS from a23-203-249-4.deploy.akamaitechnologies.com (AkamaiGHost/22.3.3.1-71e9d5dfbd3c1d9c60c216bbd0edd340) (-)
+X-Ss-Etag: 1ca4d7ba-e655cf84-9cf34d19-2a453eb4
+X-Tt-Tnc-Attr: force_accept=false
+X-Janus-Info: 1ndAKphX4vQm_udD8oPo5lBGT8utXABZvsS4l1wRNq4avJDV9GAMkS8bnUoTb-0VL3nl6FvvChPGdv2MjjY9uaAXPpnNjVXj32SSflEZeDJblevqYZ115942jnAp0zZQonYbzRObNc83o1rTNLtJsGPITgr3S8KBZk7t3S5H4M0M0cDgO_6-G99WqpzcTM-xK2p9gTbMbsyFJEn2ri9VBuMNvhfZh0_hcIFR1sEClI9rXWeUBxxWZXWADQxlifjoFZFAZZ4odck2PDLTvzc6UVEkK5Y5zfDeG4gOzEYj6Hx_MpVzF24ohSo=
+Access-Control-Expose-Headers: x-tt-traceflag,x-tt-logid
+Tt-Idc-Switch: 10000@20260101190632
+X-Tt-Trace-Host: 01f793fe228fc95195630beb465696310e1dae6dfab76946fbcaac8ff03217268bdff0e5d52ee9995b35ba82766d3f94d1671d7aa3d01aabdfd05b708095917f75688e3998deaffdf6aa94ed9d25ca9d24c7285aaae087b290bbd65d6cc437eefd
+X-Tt-Trace-Tag: id=16;cdn-cache=miss;type=dyn
+X-Origin-Response-Time: 222,23.203.249.4
+Server: TLB
+Cache-Control: max-age=0, no-cache, no-store
+Date: Sat, 03 Jan 2026 07:38:37 GMT
+
+✅ Cihaz bilgileri (2. kayıt sonrası new_user=0):
+{
+  "cdid": "ae42db54-8bc1-7c9f-9ad2-07e0c28daf0f",
+  "cookies": {},
+  "device_brand": "oppo",
+  "device_id": "1795604136001345556",
+  "device_type": "CPH2411",
+  "dpi": 440,
+  "gaid": "038fd214-dc0f-3b31-3780-93915fe34bed",
+  "install_id": "5655833746924286809",
+  "openudid": "bf3d595fefb82a34",
+  "req_id": "d1c5e521-1d81-f71f-9a60-da97ece21790",
+  "resolution": "904*2105"
+}
+执行设备激活 (alert_check)...
+设备激活结果: 200, 返回值: {"message":"success"}
+执行 ActivateDevice (alert_check)...
+设备激活结果: 200, 返回值: {"message":"success"}
+执行 MakeDsSign...
+DSign 请求结果: 200
+DSign 返回内容: {"message":"error"}
+调试: DSign 响应中未找到 tt-device-guard-server-data
+调试: MakeDsSign 执行结束
+
+获取 Seed...
+Seed 获取成功: MDGnH5/TqXsALT1/yWwxkYbhnbd+H3ZzUTd4pqoGG0bXfh7RE2xpFwB6FBq3NQKm2ekBIQTExxuYvQ7OUKHwV1HBwWeKVuBRKdBnmkFGuDRr+ccUFrPh8ygUNnzY4IXJUvE=, Type: 3
+获取 Token...
+Token 获取成功: A8MyHxyVF90gr8SZ5sZjXzm-C
+
+📤 Gönderim 1/10
+调试: 未找到 device_guard_data0
+✅ İzlenme gönderildi. Response: map[extra:map[now:1.767425923e+12] log_pb:map[impr_id:20260103153843C7CE0EFC05999280085B] status_code:0]
+
+📤 Gönderim 2/10
+调试: 未找到 device_guard_data0
+✅ İzlenme gönderildi. Response: map[extra:map[now:1.767425924e+12] log_pb:map[impr_id:202601031538443361DE6B70BACB788D42] status_code:0]
+
+📤 Gönderim 3/10
+调试: 未找到 device_guard_data0
+✅ İzlenme gönderildi. Response: map[extra:map[now:1.767425926e+12] log_pb:map[impr_id:20260103153846C7CE0EFC05999280089E] status_code:0]
+
+📤 Gönderim 4/10
+调试: 未找到 device_guard_data0
+✅ İzlenme gönderildi. Response: map[extra:map[now:1.767425927e+12] log_pb:map[impr_id:202601031538470E0A0F11EE2390DC7ABD] status_code:0]
+
+📤 Gönderim 5/10
+调试: 未找到 device_guard_data0
+✅ İzlenme gönderildi. Response: map[extra:map[now:1.767425928e+12] log_pb:map[impr_id:202601031538483361DE6B70BACB788DD4] status_code:0]
+
+📤 Gönderim 6/10
+调试: 未找到 device_guard_data0
+✅ İzlenme gönderildi. Response: map[extra:map[now:1.767425929e+12] log_pb:map[impr_id:20260103153849C7CE0EFC059992800907] status_code:0]
+
+📤 Gönderim 7/10
+调试: 未找到 device_guard_data0
+✅ İzlenme gönderildi. Response: map[extra:map[now:1.767425931e+12] log_pb:map[impr_id:202601031538513361DE6B70BACB788E11] status_code:0]
+
+📤 Gönderim 8/10
+调试: 未找到 device_guard_data0
+✅ İzlenme gönderildi. Response: map[extra:map[now:1.767425932e+12] log_pb:map[impr_id:202601031538523B76032B2DA00D24CADE] status_code:0]
+
+📤 Gönderim 9/10
+调试: 未找到 device_guard_data0
+✅ İzlenme gönderildi. Response: map[extra:map[now:1.767425933e+12] log_pb:map[impr_id:202601031538530E0A0F11EE2390DC7BB4] status_code:0]
+
+📤 Gönderim 10/10
+调试: 未找到 device_guard_data0
+✅ İzlenme gönderildi. Response: map[extra:map[now:1.767425934e+12] log_pb:map[impr_id:20260103153854C7CE0EFC059992800977] status_code:0]

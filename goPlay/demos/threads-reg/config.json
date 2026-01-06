@@ -1,0 +1,4 @@
+{
+  "enable_header_rotation": true,
+  "max_finalize_retries": 20
+}
