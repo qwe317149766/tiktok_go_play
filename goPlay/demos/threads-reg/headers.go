@@ -104,14 +104,69 @@ type IOSDeviceConfig struct {
 	Scale      string
 }
 
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
+
+// RandomizeWithConfig determines which UA to generate based on global settings
+func (m *ThreadHeaderManager) RandomizeWithConfig(enableIOS, enableAnomalous bool) {
+	if enableAnomalous {
+		m.RandomizeAnomalousUserAgent()
+	} else if enableIOS {
+		// If iOS is enabled, we randomly choose between Android and iOS for variety,
+		// or always iOS if that's preferred. Let's do a 50/50 mix for rotation.
+		if rand.Intn(2) == 0 {
+			m.RandomizeIOSUserAgent()
+		} else {
+			m.RandomizeUserAgent()
+		}
+	} else {
+		m.RandomizeUserAgent()
+	}
+}
+
+func (m *ThreadHeaderManager) RandomizeAnomalousUserAgent() {
+	ver := "411.0.0.0.75"
+	osVersions := []string{"29/10", "30/11", "31/12", "32/12", "33/13", "34/14"}
+	osVer := osVersions[rand.Intn(len(osVersions))]
+	dpis := []string{"320dpi", "400dpi", "440dpi", "480dpi", "560dpi", "600dpi", "640dpi"}
+	dpi := dpis[rand.Intn(len(dpis))]
+	locale := "en-US"
+
+	// Manufacturers for verisimilitude
+	manufacturers := []string{"Samsung", "Google", "OnePlus", "Xiaomi", "Oppo"}
+	manufacturer := manufacturers[rand.Intn(len(manufacturers))]
+
+	randomString := func(n int) string {
+		const letters = "abcdefghijklmnopqrstuvwxyz"
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = letters[rand.Intn(len(letters))]
+		}
+		return string(b)
+	}
+
+	model := randomString(6)
+	device := randomString(6)
+	hardware := randomString(6)
+
+	resolutions := []string{"1080x2029", "1080x2248", "1080x1920", "1080x2160", "1440x2560", "1440x3120", "1080x2400"}
+	res := resolutions[rand.Intn(len(resolutions))]
+	buildNum := 846252388
+
+	// Format: Barcelona [Version] Android ([OS]; [DPI]; [Resolution]; [Manufacturer]; [Model]; [Device]; [Hardware]; [Locale]; [Build Number])
+	ua := fmt.Sprintf("Barcelona %s Android (%s; %s; %s; %s; %s; %s; %s; %s; %d)",
+		ver, osVer, dpi, res, manufacturer, model, device, hardware, locale, buildNum)
+
+	m.Headers["user-agent"] = ua
+}
+
 // RandomizeUserAgent generates a random Threads/Barcelona User-Agent using Samsung and Google models
 func (m *ThreadHeaderManager) RandomizeUserAgent() {
-	rand.Seed(time.Now().UnixNano())
-
 	// Fixed version as requested
 	ver := "411.0.0.0.75"
 
-	// Android Version and API level (Recent systems + sample)
+	// Android Version and API level
 	osVersions := []string{"29/10", "30/11", "31/12", "32/12", "33/13", "34/14"}
 	osVer := osVersions[rand.Intn(len(osVersions))]
 
@@ -119,12 +174,10 @@ func (m *ThreadHeaderManager) RandomizeUserAgent() {
 	dpis := []string{"320dpi", "400dpi", "440dpi", "480dpi", "560dpi", "600dpi", "640dpi"}
 	dpi := dpis[rand.Intn(len(dpis))]
 
-	// Language (Align with accept-language zh_TW)
 	locale := "en-US"
 
 	// Specific Device Models for Google and Samsung
 	devices := []DeviceConfig{
-		// Google Pixel Models
 		{"Google", "Pixel 8 Pro", "husky", "husky"},
 		{"Google", "Pixel 8", "shiba", "shiba"},
 		{"Google", "Pixel 7 Pro", "cheetah", "cheetah"},
@@ -133,16 +186,15 @@ func (m *ThreadHeaderManager) RandomizeUserAgent() {
 		{"Google", "Pixel 6", "oriole", "oriole"},
 		{"Google", "Pixel 6a", "bluejay", "bluejay"},
 		{"Google", "Pixel 5", "redfin", "lito"},
-		// Samsung Galaxy Models
-		{"Samsung", "SM-S928B", "eureka", "s5e9945"}, // S24 Ultra
-		{"Samsung", "SM-S921B", "lyq", "s5e9945"},    // S24
-		{"Samsung", "SM-S918B", "dm3q", "kalama"},    // S23 Ultra
-		{"Samsung", "SM-S911B", "dm1q", "kalama"},    // S23
-		{"Samsung", "SM-S908B", "gts8u", "s5e9925"},  // S22 Ultra
-		{"Samsung", "SM-S901B", "s22", "s5e9925"},    // S22
-		{"Samsung", "SM-G998B", "p3s", "exynos2100"}, // S21 Ultra
-		{"Samsung", "SM-G991B", "o1s", "exynos2100"}, // S21
-		{"Samsung", "SM-N986B", "c2s", "exynos990"},  // Note 20 Ultra
+		{"Samsung", "SM-S928B", "eureka", "s5e9945"},
+		{"Samsung", "SM-S921B", "lyq", "s5e9945"},
+		{"Samsung", "SM-S918B", "dm3q", "kalama"},
+		{"Samsung", "SM-S911B", "dm1q", "kalama"},
+		{"Samsung", "SM-S908B", "gts8u", "s5e9925"},
+		{"Samsung", "SM-S901B", "s22", "s5e9925"},
+		{"Samsung", "SM-G998B", "p3s", "exynos2100"},
+		{"Samsung", "SM-G991B", "o1s", "exynos2100"},
+		{"Samsung", "SM-N986B", "c2s", "exynos990"},
 	}
 
 	dev := devices[rand.Intn(len(devices))]
@@ -151,11 +203,8 @@ func (m *ThreadHeaderManager) RandomizeUserAgent() {
 	resolutions := []string{"1080x2029", "1080x2248", "1080x1920", "1080x2160", "1440x2560", "1440x3120", "1080x2400"}
 	res := resolutions[rand.Intn(len(resolutions))]
 
-	// Build number randomization
-	// buildNum := 341962830 + rand.Intn(1000000)
 	buildNum := 846252388
 
-	// User-Agent format: Barcelona [Version] Android ([OS]; [DPI]; [Resolution]; [Manufacturer]; [Model]; [Device]; [Hardware]; [Locale]; [Build Number])
 	ua := fmt.Sprintf("Barcelona %s Android (%s; %s; %s; %s; %s; %s; %s; %s; %d)",
 		ver, osVer, dpi, res, dev.Manufacturer, dev.Model, dev.Device, dev.Hardware, locale, buildNum)
 
@@ -164,8 +213,6 @@ func (m *ThreadHeaderManager) RandomizeUserAgent() {
 
 // RandomizeIOSUserAgent generates a random Threads/Barcelona User-Agent using iPhone models
 func (m *ThreadHeaderManager) RandomizeIOSUserAgent() {
-	rand.Seed(time.Now().UnixNano())
-
 	ver := "411.0.0.0.75"
 
 	// iOS versions
@@ -181,7 +228,7 @@ func (m *ThreadHeaderManager) RandomizeIOSUserAgent() {
 		{"iPhone11,4", "1242x2688", "3.00"}, // iPhone XS Max
 		{"iPhone11,8", "828x1792", "2.00"},  // iPhone XR
 		{"iPhone12,1", "828x1792", "2.00"},  // iPhone 11
-		{"iPhone12,3", "1125x2436", "3.00"}, // iPhone 11 Pro
+		{"iPhone12,3", "1125x2436", "3.00"}, // iPhone 1 Pro
 		{"iPhone13,2", "1170x2532", "3.00"}, // iPhone 12
 		{"iPhone14,5", "1170x2532", "3.00"}, // iPhone 13
 		{"iPhone15,3", "1290x2796", "3.00"}, // iPhone 14 Pro Max
@@ -192,7 +239,6 @@ func (m *ThreadHeaderManager) RandomizeIOSUserAgent() {
 	lang := "en"
 	buildNum := 627270390 + rand.Intn(10000)
 
-	// User-Agent format: Barcelona [Version] ([Model]; [OS]; [Locale]; [Lang]; scale=[Scale]; [Resolution]; [Build Number]) AppleWebKit/420+
 	ua := fmt.Sprintf("Barcelona %s (%s; iOS %s; %s; %s; scale=%s; %s; %d) AppleWebKit/420+",
 		ver, dev.Model, osVer, locale, lang, dev.Scale, dev.Resolution, buildNum)
 

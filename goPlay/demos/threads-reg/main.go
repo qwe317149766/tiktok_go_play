@@ -13,15 +13,12 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
-	"unsafe"
 
 	"github.com/google/uuid"
 )
@@ -330,21 +327,8 @@ func init() {
 	loadEnvConfig()
 	loadGlobalConfig()
 	loadBackup()
-	// Enable ANSI colors on Windows
-	if runtime.GOOS == "windows" {
-		kernel32 := syscall.NewLazyDLL("kernel32.dll")
-		setConsoleMode := kernel32.NewProc("SetConsoleMode")
-		getConsoleMode := kernel32.NewProc("GetConsoleMode")
-		getStdHandle := kernel32.NewProc("GetStdHandle")
-
-		const STD_OUTPUT_HANDLE = uint32(0xfffffff5) // -11
-		const ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-
-		handle, _, _ := getStdHandle.Call(uintptr(STD_OUTPUT_HANDLE))
-		var mode uint32
-		getConsoleMode.Call(handle, uintptr(unsafe.Pointer(&mode)))
-		setConsoleMode.Call(handle, uintptr(mode|ENABLE_VIRTUAL_TERMINAL_PROCESSING))
-	}
+	// ANSI colors are supported by default on Linux/macOS.
+	// Windows 10+ also supports them in modern terminals.
 
 	go func() {
 		os.MkdirAll("log", 0755)
@@ -657,6 +641,7 @@ type AppConfig struct {
 	MaxSuccessPerFile     int  `json:"max_success_per_file"`
 	TotalSuccessLimit     int  `json:"total_success_limit"`
 	HttpRequestTimeoutSec int  `json:"http_request_timeout_sec"`
+	EnableAnomalousUA     bool `json:"enable_anomalous_ua"`
 }
 
 var (
@@ -686,6 +671,7 @@ var (
 		MaxSuccessPerFile:     10,    // Default 10 successes per file
 		TotalSuccessLimit:     1000,  // Default total success limit
 		HttpRequestTimeoutSec: 30,    // Default 30 seconds
+		EnableAnomalousUA:     false,
 	}
 
 	apiSem chan struct{} // Throttler for Instagram API
@@ -957,6 +943,8 @@ func loadEnvConfig() {
 			if val, err := strconv.Atoi(valStr); err == nil {
 				globalConfig.SMSWaitTimeoutSec = val
 			}
+		case "ENABLE_ANOMALOUS_UA":
+			globalConfig.EnableAnomalousUA = strings.EqualFold(valStr, "true") || valStr == "1"
 		}
 	}
 }
@@ -1260,7 +1248,7 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 
 	// Create Header Manager Singleton for this registration loop
 	hm := NewThreadHeaderManager()
-	hm.RandomizeUserAgent()
+	hm.RandomizeWithConfig(enableIOSRotation, globalConfig.EnableAnomalousUA)
 
 	// Generate core device IDs for the entire session
 	DeviceID := uuid.New().String()
@@ -1672,11 +1660,7 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 		if err != nil {
 			// PollUntilParamSuccess internally rotates IP on error
 			if globalConfig.EnableHeaderRotation {
-				if enableIOSRotation {
-					hm.RandomizeIOSUserAgent()
-				} else {
-					hm.RandomizeUserAgent()
-				}
+				hm.RandomizeWithConfig(enableIOSRotation, globalConfig.EnableAnomalousUA)
 			}
 			continue
 		}
@@ -1701,11 +1685,7 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 				RotateClientProxy(client, pm, workerID)
 
 				if globalConfig.EnableHeaderRotation {
-					if enableIOSRotation {
-						hm.RandomizeIOSUserAgent()
-					} else {
-						hm.RandomizeUserAgent()
-					}
+					hm.RandomizeWithConfig(enableIOSRotation, globalConfig.EnableAnomalousUA)
 				}
 				// Refresh IP info for display and logging
 				if info, err := GetIPAndTimezone(pm.GetProxyWithConn(workerID)); err == nil {
