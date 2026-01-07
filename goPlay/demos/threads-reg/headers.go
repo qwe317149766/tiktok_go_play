@@ -51,7 +51,7 @@ func NewThreadHeaderManager() *ThreadHeaderManager {
 	m.Headers["x-fb-client-ip"] = "True"
 	m.Headers["x-fb-server-cluster"] = "True"
 	m.Headers["accept-encoding"] = "gzip"
-	m.Headers["content-encoding"] = "gzip"
+	// m.Headers["content-encoding"] = "gzip" // Removed to match instagram.go (no request compression)
 
 	// New Android simulation headers
 	m.Headers["x-ig-connection-type"] = "WIFI"
@@ -64,6 +64,52 @@ func NewThreadHeaderManager() *ThreadHeaderManager {
 	m.Headers["x-ig-mapped-locale"] = lang
 	m.Headers["x-pigeon-rawclienttime"] = fmt.Sprintf("%.3f", float64(time.Now().UnixMilli())/1000.0)
 	m.Headers["x-fb-device-group"] = "3614"
+
+	return m
+}
+
+// NewInstagramHeaderManager creates a new manager with Instagram-specific defaults
+func NewInstagramHeaderManager() *ThreadHeaderManager {
+	rand.Seed(time.Now().UnixNano())
+	m := &ThreadHeaderManager{
+		Headers:        make(map[string]string),
+		BloksVersionID: "b7737193b91c3a2f4050bdfc9d9ae0f578a93b4181fd43efe549daacba5c7db9",
+		AppID:          "567067343352427",
+		FriendlyName:   "IgApi: bloks/async_action/com.bloks.www.fx.settings.security.two_factor.totp.generate_key/",
+		ClientDocID:    "", // Not typically used for this flow or differs
+		BloksAppID:     "com.bloks.www.fx.settings.security.two_factor.totp.generate_key",
+	}
+	lang := "zh_TW"
+	// Initial default headers for Instagram
+	m.Headers["host"] = "i.instagram.com"
+	m.Headers["x-ig-capabilities"] = "3brTv10="
+	m.Headers["x-ig-validate-null-in-legacy-dict"] = "true"
+	m.Headers["x-ig-timezone-offset"] = "14400"
+	m.Headers["x-tigon-is-retry"] = "False"
+	m.Headers["accept-language"] = "zh-TW, en-US"
+	m.Headers["x-ig-is-foldable"] = "false"
+	m.Headers["priority"] = "u=3"
+	m.Headers["content-type"] = "application/x-www-form-urlencoded; charset=UTF-8"
+	m.Headers["x-fb-http-engine"] = "Tigon/MNS/TCP"
+	m.Headers["x-fb-client-ip"] = "True"
+	m.Headers["x-fb-connection-type"] = "WIFI"
+	m.Headers["x-fb-network-properties"] = "Wifi;VPN;Validated;"
+	m.Headers["x-fb-server-cluster"] = "True"
+	m.Headers["accept-encoding"] = "gzip, deflate, br"
+	// m.Headers["content-encoding"] = "gzip"
+
+	// New Android simulation headers
+	m.Headers["x-ig-connection-type"] = "WIFI"
+
+	// Default dynamic values matching instagram.go patterns
+	m.Headers["x-ig-bandwidth-speed-kbps"] = "909.000"
+	m.Headers["x-ig-bandwidth-totalbytes-b"] = "7670967"
+	m.Headers["x-ig-bandwidth-totaltime-ms"] = "52654"
+
+	m.Headers["x-ig-device-locale"] = lang
+	m.Headers["x-ig-app-locale"] = lang
+	m.Headers["x-ig-mapped-locale"] = lang
+	m.Headers["x-ig-device-languages"] = "{\"system_languages\":\"zh-TW\"}"
 
 	return m
 }

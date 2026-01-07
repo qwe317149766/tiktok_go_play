@@ -327,8 +327,7 @@ func init() {
 	loadEnvConfig()
 	loadGlobalConfig()
 	loadBackup()
-	// ANSI colors are supported by default on Linux/macOS.
-	// Windows 10+ also supports them in modern terminals.
+	initConsole()
 
 	go func() {
 		os.MkdirAll("log", 0755)
@@ -368,6 +367,14 @@ func init() {
 				currentDay = day
 				idx := 0
 				for {
+					if idx >= 10 {
+						// log最多生成 10个，多了就先删除前9个然后继续
+						for i := 0; i < 9; i++ {
+							os.Remove(fmt.Sprintf("log/threads_reg_%s_%d.log", day, i))
+						}
+						// Move index back or just reset to 0 to keep the logic simple as requested
+						idx = 0
+					}
 					path := fmt.Sprintf("log/threads_reg_%s_%d.log", day, idx)
 					if stat, err := os.Stat(path); err == nil && stat.Size() >= maxLogSize {
 						idx++
@@ -426,8 +433,8 @@ func GenerateRandomAndroidID() string {
 	return fmt.Sprintf("%s-%s", "android", string(b))
 }
 
-// ExtractTokenAndUsername attempts to pull username, registration token, pkid, and sessionid from a potentially complex JSON response
-func ExtractTokenAndUsername(data string) (string, string, string, string, string) {
+// ExtractTokenAndUsername attempts to pull username, registration token, pkid, sessionid, nonce, and fbid_v2 from a potentially complex JSON response
+func ExtractTokenAndUsername(data string) (string, string, string, string, string, string) {
 	// 1. Username pattern
 	userRe := regexp.MustCompile(`(?i)username[\\"]+:[\\"\s]*[\\"]+([^"\\]+)`)
 	userMatch := userRe.FindStringSubmatch(data)
@@ -480,7 +487,15 @@ func ExtractTokenAndUsername(data string) (string, string, string, string, strin
 		nonce = nonceMatch[1]
 	}
 
-	return username, fullAuth, pkid, sessionid, nonce
+	// 5. fbid_v2 pattern
+	fbidRe := regexp.MustCompile(`fbid_v2[\\"]+:(\d+)`)
+	fbidMatch := fbidRe.FindStringSubmatch(data)
+	fbidV2 := ""
+	if len(fbidMatch) > 1 {
+		fbidV2 = fbidMatch[1]
+	}
+
+	return username, fullAuth, pkid, sessionid, nonce, fbidV2
 }
 
 // PollUntilParamSuccess repeatedly calls the API until GetParamsByApiName succeeds or maxRetries is reached
@@ -507,8 +522,8 @@ func PollUntilParamSuccess(targetApi string, cfg ThreadsRequestConfig, minSleepS
 			updateDisplay(workerID, cfg.PhoneNumber, cfg.BloksAppID, fmt.Sprintf("Err: %v (Rotating...)", err))
 			RotateClientProxy(cfg.HTTPClient, pm, workerID)
 			consecutiveErrors++
-			if maxRetries > 0 && consecutiveErrors >= 3 {
-				return nil, fmt.Errorf("consecutive errors reached limit (3): %v", err)
+			if maxRetries > 0 && consecutiveErrors >= 5 {
+				return nil, fmt.Errorf("consecutive errors reached limit (5): %v", err)
 			}
 		} else {
 			consecutiveErrors = 0
@@ -840,7 +855,7 @@ func startDisplayRefresher() {
 				}
 
 				// Move to specific row and clear line before printing
-				fmt.Printf("\x1b[%d;1H\x1b[K[\x1b[33mw%d\x1b[0m] \x1b[35m%-12s\x1b[0m %-8s %s%s\x1b[0m",
+				fmt.Printf("\x1b[%d;1H\x1b[K[\x1b[33mw%d\x1b[0m] \x1b[35m%-22s\x1b[0m %-8s %s%s\x1b[0m",
 					currentRow, id, state.phone, state.api, color, cleanStatus)
 				currentRow++
 			}
@@ -1006,8 +1021,22 @@ func clearScreen() {
 func updateDisplay(workerID int, phone string, apiName string, status string) {
 	displayMu.Lock()
 	defer displayMu.Unlock()
+
+	displayPhone := phone
+	if phone != "N/A" && phone != "" {
+		dataMu.Lock()
+		cur := phoneRegCounts[phone]
+		max := phoneMaxCounts[phone]
+		target := max
+		if target > globalMaxSuccessCount {
+			target = globalMaxSuccessCount
+		}
+		dataMu.Unlock()
+		displayPhone = fmt.Sprintf("%s[%d/%d]", phone, cur, target)
+	}
+
 	workerStatuses[workerID] = workerState{
-		phone:      phone,
+		phone:      displayPhone,
 		api:        apiName,
 		status:     status,
 		lastUpdate: time.Now(),
@@ -1246,486 +1275,494 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 		time.Sleep(2 * time.Second)
 	}
 
-	// Create Header Manager Singleton for this registration loop
-	hm := NewThreadHeaderManager()
-	hm.RandomizeWithConfig(enableIOSRotation, globalConfig.EnableAnomalousUA)
-
-	// Generate core device IDs for the entire session
-	DeviceID := uuid.New().String()
-	AndroidID := GenerateRandomAndroidID()
-	FamilyDeviceID := uuid.New().String()
-	WaterfallID := uuid.New().String()
-
-	// --- STEP 0: Mobile Config ---
-	updateDisplay(workerID, phoneNum, "MobileConfig", "Init...")
-	var mid string
-	var pubKey string
-	var keyIdInt int
-	for {
-		if time.Now().After(deadline) {
-			logFailureAtomically(workerID, phoneNum, "MobileConfig", "MC_TIMEOUT")
-			return false
-		}
-		sessionID_mc := "UFS-" + uuid.New().String() + "-0"
-
-		hm.SetIDs(DeviceID, AndroidID, FamilyDeviceID, WaterfallID, sessionID_mc)
-		_, mcHeaders, err := ExecuteMobileConfig(client, hm, DeviceID, sessionID_mc, workerID)
-
-		if err != nil {
-			updateDisplay(workerID, phoneNum, "MobileConfig", "Failed, rotating...")
+	// Full registration attempt loop (Identity Reset Loop)
+	for attempt := 1; attempt <= 3; attempt++ {
+		if attempt > 1 {
+			AsyncLog(fmt.Sprintf("[w%d] [%s] Full Reset: Changing IP and Device IDs (Attempt %d/3)...", workerID, phoneNum, attempt))
 			proxyURL = RotateClientProxy(client, pm, workerID)
-			time.Sleep(5 * time.Second)
-			continue
 		}
 
-		// 提取 Header 参数
-		mid = mcHeaders.Get("Ig-Set-X-Mid")
-		pubKey = mcHeaders.Get("ig-set-password-encryption-pub-key")
-		keyIdStr := mcHeaders.Get("ig-set-password-encryption-key-id")
+		// Create Header Manager Singleton for this registration loop
+		hm := NewThreadHeaderManager()
+		hm.RandomizeWithConfig(enableIOSRotation, globalConfig.EnableAnomalousUA)
 
-		if pubKey == "" {
-			pubKey = mcHeaders.Get("Ig-Set-X-Pub-Key")
-			keyIdStr = mcHeaders.Get("Ig-Set-X-Key-Id")
-		}
+		// Generate core device IDs for the entire session
+		DeviceID := uuid.New().String()
+		AndroidID := GenerateRandomAndroidID()
+		FamilyDeviceID := uuid.New().String()
+		WaterfallID := uuid.New().String()
 
-		keyIdInt, _ = strconv.Atoi(keyIdStr)
-
-		if mid != "" {
-			break
-		}
-		RotateClientProxy(client, pm, workerID)
-		time.Sleep(1 * time.Second)
-	}
-
-	// --- STEP 0.5: Create Android Keystore ---
-	updateDisplay(workerID, phoneNum, "Keystore", "Preparing...")
-	var challengeNonce string
-	for {
-		if time.Now().After(deadline) {
-			logFailureAtomically(workerID, phoneNum, "Keystore", "KS_TIMEOUT")
-			return false
-		}
-		ksResp, _, err := ExecuteCreateAndroidKeystore(client, hm, AndroidID, workerID)
-		if err != nil {
-			updateDisplay(workerID, phoneNum, "Keystore", "Failed, rotating...")
-			proxyURL = RotateClientProxy(client, pm, workerID)
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		var ksMap map[string]any
-		if err := json.Unmarshal([]byte(ksResp), &ksMap); err == nil {
-			if nonce, ok := ksMap["challenge_nonce"].(string); ok {
-				challengeNonce = nonce
+		// --- STEP 0: Mobile Config ---
+		updateDisplay(workerID, phoneNum, "MobileConfig", "Init...")
+		var mid string
+		var pubKey string
+		var keyIdInt int
+		mcSuccess := false
+		for {
+			if time.Now().After(deadline) {
+				logFailureAtomically(workerID, phoneNum, "MobileConfig", "MC_TIMEOUT")
+				return false
 			}
-		}
-		break
-	}
+			sessionID_mc := "UFS-" + uuid.New().String() + "-0"
 
-	// --- STEP 1: Process start.async ---
-	step1Config := ThreadsRequestConfig{
-		DeviceID:       DeviceID,
-		AndroidID:      AndroidID,
-		FamilyDeviceID: FamilyDeviceID,
-		WaterfallID:    WaterfallID,
-		BloksAppID:     "com.bloks.www.bloks.caa.reg.start.async",
-		FriendlyName:   "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.start.async",
-		ProxyURL:       proxyURL,
-		HeaderManager:  hm,
-		HTTPClient:     client,
-		PhoneNumber:    phoneNum,
-		WorkerID:       workerID,
-	}
+			hm.SetIDs(DeviceID, AndroidID, FamilyDeviceID, WaterfallID, sessionID_mc)
+			_, mcHeaders, err := ExecuteMobileConfig(client, hm, DeviceID, sessionID_mc, workerID)
 
-	jsonParams := map[string]any{
-		"family_device_id": step1Config.FamilyDeviceID,
-		"qe_device_id":     step1Config.DeviceID,
-		"device_id":        step1Config.AndroidID,
-		"waterfall_id":     step1Config.WaterfallID,
-		"reg_flow_source":  "threads_ig_account_creation",
-		"skip_welcome":     false,
-		"is_from_spc":      false,
-	}
-
-	InnerParamsString, _ := json.Marshal(jsonParams)
-	step1Config.InnerParams = string(InnerParamsString)
-	targetApi := "com.bloks.www.bloks.caa.reg.async.contactpoint_phone.async"
-	paramsStep1, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
-	if err != nil {
-		AsyncLog(fmt.Sprintf("[w%d] [%s] Step 1 failed: %v", workerID, phoneNum, err))
-		logFailureAtomically(workerID, phoneNum, "START", "STEP1_FAILED")
-		return false
-	}
-
-	jsonParamsStep1, _ := json.Marshal(paramsStep1)
-
-	// --- STEP 2: Process contactpoint_phone.async ---
-	AsyncLog(fmt.Sprintf("[w%d] [%s] Starting Step 2...", workerID, phoneNum))
-
-	jsonParamsStep2 := map[string]any{
-		"params": JSONStringify(map[string]any{
-			"client_input_params": JSONStringify(map[string]any{
-				"aac":                           "",
-				"device_id":                     step1Config.AndroidID,
-				"was_headers_prefill_available": 0,
-				"login_upsell_phone_list":       []any{},
-				"whatsapp_installed_on_client":  0,
-				"zero_balance_state":            "",
-				"network_bssid":                 nil,
-				"msg_previous_cp":               "",
-				"switch_cp_first_time_loading":  1,
-				"accounts_list":                 []any{},
-				"confirmed_cp_and_code":         map[string]any{},
-				"country_code":                  "",
-				"family_device_id":              step1Config.FamilyDeviceID,
-				"block_store_machine_id":        "",
-				"fb_ig_device_id":               []any{},
-				"phone":                         phoneNum,
-				"lois_settings": map[string]any{
-					"lois_token": "",
-				},
-				"cloud_trust_token":        nil,
-				"was_headers_prefill_used": 0,
-				"headers_infra_flow_id":    "",
-				"build_type":               "release",
-				"encrypted_msisdn":         "",
-				"switch_cp_have_seen_suma": 0,
-			}),
-			"server_params": string(jsonParamsStep1),
-		}),
-	}
-
-	step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.async.contactpoint_phone.async"
-	step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.async.contactpoint_phone.async"
-	step1Config.InnerParams = JSONStringify(jsonParamsStep2)
-
-	targetApi = "com.bloks.www.bloks.caa.reg.confirmation.async"
-	paramsStep2, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
-	if err != nil {
-		logFailureAtomically(workerID, phoneNum, targetApi, "STEP2_FAILED")
-		return false
-	}
-
-	// --- STEP 3: Fetch SMS Code and Verify ---
-	smsTimeout := time.Duration(globalConfig.SMSWaitTimeoutSec) * time.Second
-	code, rawMsg, err := smsMgr.PollCode(phoneNum, smsTimeout, workerID)
-	if err != nil {
-		updateDisplay(workerID, phoneNum, "SMS", "Timeout")
-		// Log as silent failure (don't increment failCount) to allow dispatcher to retry fairly
-		logSilentFailure(phoneNum, "SMS_TIMEOUT")
-		return false
-	}
-	AsyncLog(fmt.Sprintf("[w%d] [%s] SMS Received: %s", workerID, phoneNum, rawMsg))
-
-	jsonParamsStep3 := map[string]any{
-		"params": JSONStringify(map[string]any{
-			"client_input_params": JSONStringify(map[string]any{
-				"confirmed_cp_and_code":  map[string]any{},
-				"aac":                    "",
-				"block_store_machine_id": "",
-				"code":                   code,
-				"fb_ig_device_id":        []any{},
-				"device_id":              step1Config.AndroidID,
-				"lois_settings": map[string]any{
-					"lois_token": "",
-				},
-				"cloud_trust_token": nil,
-				"network_bssid":     nil,
-			}),
-			"server_params": JSONStringify(paramsStep2),
-		}),
-	}
-
-	step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.confirmation.async"
-	step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.confirmation.async"
-	step1Config.InnerParams = JSONStringify(jsonParamsStep3)
-
-	targetApi = "com.bloks.www.bloks.caa.reg.password.async"
-	paramsStep3, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
-	if err != nil {
-		logFailureAtomically(workerID, phoneNum, targetApi, "STEP3_FAILED")
-		return false
-	}
-
-	passwordLen := rand.Intn(5) + 8
-	password := GenerateRandomPassword(passwordLen)
-	updateDisplay(workerID, phoneNum, "Password", "Encrypting...")
-	timestamp := time.Now().Unix()
-	safetynet_response := "API_ERROR:+class+com.google.android.gms.common.api.ApiException:7:+"
-
-	tokenBytes := make([]byte, 24)
-	crand.Read(tokenBytes)
-	tokenData := fmt.Sprintf("%s|%d|", phoneNum, timestamp)
-	safetynet_token := base64.StdEncoding.EncodeToString(append([]byte(tokenData), tokenBytes...))
-
-	passwordEnd, _, err := EncryptPassword4NodeCompatible(pubKey, keyIdInt, password)
-	// if err != nil {
-	// AsyncLog(fmt.Sprintf("[%s] RSA encryption failed: %v. Using fallback.", phoneNum, err))
-	passwordEnd = fmt.Sprintf("#PWD_INSTAGRAM:0:%d:%s", timestamp, password)
-	// }
-	jsonParamsStepPassword := map[string]any{
-		"params": JSONStringify(map[string]any{
-			"client_input_params": JSONStringify(map[string]any{
-				"safetynet_response":                    safetynet_response,
-				"caa_play_integrity_attestation_result": "",
-				"aac":                                   "",
-				"safetynet_token":                       safetynet_token,
-				"whatsapp_installed_on_client":          0,
-				"zero_balance_state":                    "",
-				"network_bssid":                         nil,
-				"machine_id":                            mid,
-				"headers_last_infra_flow_id_safetynet":  "",
-				"email_oauth_token_map":                 map[string]any{},
-				"block_store_machine_id":                "",
-				"fb_ig_device_id":                       []any{},
-				"encrypted_msisdn_for_safetynet":        "",
-				"lois_settings": map[string]any{
-					"lois_token": "",
-				},
-				"cloud_trust_token":     nil,
-				"client_known_key_hash": "",
-				"encrypted_password":    passwordEnd,
-			}),
-			"server_params": JSONStringify(paramsStep3),
-		}),
-	}
-
-	step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.password.async"
-	step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.password.async"
-	step1Config.InnerParams = JSONStringify(jsonParamsStepPassword)
-
-	targetApi = "com.bloks.www.bloks.caa.reg.birthday.async"
-	paramsStep4, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
-	if err != nil {
-		logFailureAtomically(workerID, phoneNum, targetApi, "STEP4_FAILED")
-		return false
-	}
-
-	day, month, year := GenerateRandomBirthday(18, 40)
-	birthdayStr := fmt.Sprintf("%02d-%02d-%d", day, month, year)
-	birthDayTimestamp, err := GetTimestampByBirthdayAndTZ(birthdayStr, geoInfo.Timezone)
-	if err != nil {
-		birthDayTimestamp = time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local).Unix()
-	}
-
-	AsyncLog(fmt.Sprintf("[w%d] [%s] Starting Step 5...", workerID, phoneNum))
-	jsonParamsStep5 := map[string]any{
-		"params": JSONStringify(map[string]any{
-			"client_input_params": JSONStringify(map[string]any{
-				"client_timezone":                 geoInfo.Timezone,
-				"aac":                             "",
-				"birthday_or_current_date_string": birthdayStr,
-				"os_age_range":                    "",
-				"birthday_timestamp":              birthDayTimestamp,
-				"lois_settings": map[string]any{
-					"lois_token": "",
-				},
-				"zero_balance_state":                "",
-				"network_bssid":                     nil,
-				"should_skip_youth_tos":             0,
-				"is_youth_regulation_flow_complete": 0,
-			}),
-			"server_params": JSONStringify(paramsStep4),
-		}),
-	}
-
-	step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.birthday.async"
-	step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.birthday.async"
-	step1Config.InnerParams = JSONStringify(jsonParamsStep5)
-
-	targetApi = "com.bloks.www.bloks.caa.reg.name_ig_and_soap.async"
-	paramsStep5, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
-	if err != nil {
-		logFailureAtomically(workerID, phoneNum, targetApi, "STEP5_FAILED")
-		return false
-	}
-
-	AsyncLog(fmt.Sprintf("[w%d] [%s] Starting Step 6...", workerID, phoneNum))
-	jsonParamsStep6 := map[string]any{
-		"params": JSONStringify(map[string]any{
-			"client_input_params": JSONStringify(map[string]any{
-				"accounts_list": []any{},
-				"aac":           "",
-				"lois_settings": map[string]any{
-					"lois_token": "",
-				},
-				"zero_balance_state": "",
-				"network_bssid":      nil,
-				"name":               "",
-			}),
-			"server_params": JSONStringify(paramsStep5),
-		}),
-	}
-
-	step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.name_ig_and_soap.async"
-	step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.name_ig_and_soap.async"
-	step1Config.InnerParams = JSONStringify(jsonParamsStep6)
-
-	targetApi = "com.bloks.www.bloks.caa.reg.username.async"
-	paramsStep6, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
-	if err != nil {
-		logFailureAtomically(workerID, phoneNum, targetApi, "STEP6_FAILED")
-		return false
-	}
-
-	regInfo := paramsStep6["reg_info"]
-	regInfoMap := make(map[string]any)
-	if regInfo != "" {
-		_ = json.Unmarshal([]byte(regInfo), &regInfoMap)
-	}
-	usernameArg := ""
-	if u, ok := regInfoMap["username_prefill"].(string); ok {
-		usernameArg = u
-	}
-
-	AsyncLog(fmt.Sprintf("[w%d] [%s] Starting Step 7...", workerID, phoneNum))
-	jsonParamsStep7 := map[string]any{
-		"params": JSONStringify(map[string]any{
-			"client_input_params": JSONStringify(map[string]any{
-				"validation_text":  usernameArg,
-				"aac":              "",
-				"family_device_id": step1Config.FamilyDeviceID,
-				"device_id":        step1Config.AndroidID,
-				"lois_settings": map[string]any{
-					"lois_token": "",
-				},
-				"zero_balance_state": "",
-				"network_bssid":      nil,
-				"qe_device_id":       step1Config.DeviceID,
-			}),
-			"server_params": JSONStringify(paramsStep6),
-		}),
-	}
-
-	step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.username.async"
-	step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.username.async"
-	step1Config.InnerParams = JSONStringify(jsonParamsStep7)
-
-	targetApi = "com.bloks.www.bloks.caa.reg.create.account.async"
-	paramsStep7, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
-	if err != nil {
-		logFailureAtomically(workerID, phoneNum, targetApi, "STEP7_FAILED")
-		return false
-	}
-
-	// Step 8: com.bloks.www.bloks.caa.reg.create.account.async
-	updateDisplay(workerID, phoneNum, "CreateAccount", "Finalizing...")
-	jsonParamsStep8 := map[string]any{
-		"params": JSONStringify(map[string]any{
-			"client_input_params": JSONStringify(map[string]any{
-				"ck_error":                   "",
-				"aac":                        "",
-				"device_id":                  step1Config.AndroidID,
-				"waterfall_id":               step1Config.WaterfallID,
-				"zero_balance_state":         "",
-				"network_bssid":              nil,
-				"failed_birthday_year_count": "",
-				"headers_last_infra_flow_id": "",
-				"ig_partially_created_account_nonce_expiry": 0,
-				"machine_id":                         mid,
-				"should_ignore_existing_login":       0,
-				"reached_from_tos_screen":            1,
-				"ig_partially_created_account_nonce": "",
-				"ck_nonce":                           "",
-				"force_sessionless_nux_experience":   0,
-				"lois_settings": map[string]any{
-					"lois_token": "",
-				},
-				"ig_partially_created_account_user_id": 0,
-				"ck_id":                                "",
-				"no_contact_perm_email_oauth_token":    "",
-				"encrypted_msisdn":                     "",
-			}),
-			"server_params": JSONStringify(paramsStep7),
-		}),
-	}
-
-	step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.create.account.async"
-	step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.create.account.async"
-	step1Config.InnerParams = JSONStringify(jsonParamsStep8)
-
-	if challengeNonce != "" {
-		step1Config.HeaderOverrides = map[string]string{
-			"x-ig-attest-params": fmt.Sprintf(`{"attestation":[{"version":2,"type":"keystore","errors":[-1014],"challenge_nonce":"%s","signed_nonce":"","key_hash":""}]}`, challengeNonce),
-		}
-	}
-
-	success := false
-	for i := 1; i <= finalizeRetries; i++ {
-		if time.Now().After(deadline) {
-			return false
-		}
-		updateDisplay(workerID, phoneNum, "Finalize", fmt.Sprintf("Finalizing (Attempt %d)...", i))
-		paramsStep8, err := PollUntilParamSuccess("", step1Config, 1, 2, 1, workerID, pm)
-		if err != nil {
-			// PollUntilParamSuccess internally rotates IP on error
-			if globalConfig.EnableHeaderRotation {
-				hm.RandomizeWithConfig(enableIOSRotation, globalConfig.EnableAnomalousUA)
-			}
-			continue
-		}
-
-		if paramsStep8 != nil {
-			body := paramsStep8["full_response"]
-			finalUsername, finalToken, finalPKID, finalSessionID, _ := ExtractTokenAndUsername(body)
-
-			// Reject usernames containing "Instagram User"
-			if strings.Contains(finalUsername, "Instagram User") {
-				logFailureAtomically(workerID, phoneNum, "Finalize", "Instagram User detected")
+			if err != nil {
+				updateDisplay(workerID, phoneNum, "MobileConfig", "Failed, rotating...")
+				proxyURL = RotateClientProxy(client, pm, workerID)
+				time.Sleep(5 * time.Second)
 				continue
 			}
 
-			// If response tells us to try again or we failed to get registration tokens
-			if strings.Contains(body, "Please try again") || finalUsername == "" || finalToken == "" {
-				uaType := "UA"
-				if enableIOSRotation {
-					uaType = "iOS UA"
-				}
-				updateDisplay(workerID, phoneNum, "Finalize", fmt.Sprintf("Failed, rotating IP & %s...", uaType))
-				RotateClientProxy(client, pm, workerID)
+			// 提取 Header 参数
+			mid = mcHeaders.Get("Ig-Set-X-Mid")
+			pubKey = mcHeaders.Get("ig-set-password-encryption-pub-key")
+			keyIdStr := mcHeaders.Get("ig-set-password-encryption-key-id")
 
+			if pubKey == "" {
+				pubKey = mcHeaders.Get("Ig-Set-X-Pub-Key")
+				keyIdStr = mcHeaders.Get("Ig-Set-X-Key-Id")
+			}
+
+			keyIdInt, _ = strconv.Atoi(keyIdStr)
+
+			if mid != "" {
+				mcSuccess = true
+				break
+			}
+			proxyURL = RotateClientProxy(client, pm, workerID)
+			time.Sleep(1 * time.Second)
+		}
+
+		if !mcSuccess {
+			continue
+		}
+
+		// --- STEP 0.5: Create Android Keystore ---
+		updateDisplay(workerID, phoneNum, "Keystore", "Preparing...")
+		var challengeNonce string
+		for {
+			if time.Now().After(deadline) {
+				logFailureAtomically(workerID, phoneNum, "Keystore", "KS_TIMEOUT")
+				return false
+			}
+			ksResp, _, err := ExecuteCreateAndroidKeystore(client, hm, AndroidID, workerID)
+			if err != nil {
+				updateDisplay(workerID, phoneNum, "Keystore", "Failed, rotating...")
+				proxyURL = RotateClientProxy(client, pm, workerID)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+
+			var ksMap map[string]any
+			if err := json.Unmarshal([]byte(ksResp), &ksMap); err == nil {
+				if nonce, ok := ksMap["challenge_nonce"].(string); ok {
+					challengeNonce = nonce
+				}
+			}
+			break
+		}
+
+		// --- STEP 1: Process start.async ---
+		step1Config := ThreadsRequestConfig{
+			DeviceID:       DeviceID,
+			AndroidID:      AndroidID,
+			FamilyDeviceID: FamilyDeviceID,
+			WaterfallID:    WaterfallID,
+			BloksAppID:     "com.bloks.www.bloks.caa.reg.start.async",
+			FriendlyName:   "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.start.async",
+			ProxyURL:       proxyURL,
+			HeaderManager:  hm,
+			HTTPClient:     client,
+			PhoneNumber:    phoneNum,
+			WorkerID:       workerID,
+		}
+
+		jsonParams := map[string]any{
+			"family_device_id": step1Config.FamilyDeviceID,
+			"qe_device_id":     step1Config.DeviceID,
+			"device_id":        step1Config.AndroidID,
+			"waterfall_id":     step1Config.WaterfallID,
+			"reg_flow_source":  "threads_ig_account_creation",
+			"skip_welcome":     false,
+			"is_from_spc":      false,
+		}
+
+		InnerParamsString, _ := json.Marshal(jsonParams)
+		step1Config.InnerParams = string(InnerParamsString)
+		targetApi := "com.bloks.www.bloks.caa.reg.async.contactpoint_phone.async"
+		paramsStep1, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 5, workerID, pm)
+		if err != nil {
+			AsyncLog(fmt.Sprintf("[w%d] [%s] Step 1 failed 5 times, resetting identity: %v", workerID, phoneNum, err))
+			continue // Identity Reset: Loop back to start with new IDs and Proxy
+		}
+
+		jsonParamsStep1, _ := json.Marshal(paramsStep1)
+
+		// --- STEP 2: Process contactpoint_phone.async ---
+		AsyncLog(fmt.Sprintf("[w%d] [%s] Starting Step 2...", workerID, phoneNum))
+
+		jsonParamsStep2 := map[string]any{
+			"params": JSONStringify(map[string]any{
+				"client_input_params": JSONStringify(map[string]any{
+					"aac":                           "",
+					"device_id":                     step1Config.AndroidID,
+					"was_headers_prefill_available": 0,
+					"login_upsell_phone_list":       []any{},
+					"whatsapp_installed_on_client":  0,
+					"zero_balance_state":            "",
+					"network_bssid":                 nil,
+					"msg_previous_cp":               "",
+					"switch_cp_first_time_loading":  1,
+					"accounts_list":                 []any{},
+					"confirmed_cp_and_code":         map[string]any{},
+					"country_code":                  "",
+					"family_device_id":              step1Config.FamilyDeviceID,
+					"block_store_machine_id":        "",
+					"fb_ig_device_id":               []any{},
+					"phone":                         phoneNum,
+					"lois_settings": map[string]any{
+						"lois_token": "",
+					},
+					"cloud_trust_token":        nil,
+					"was_headers_prefill_used": 0,
+					"headers_infra_flow_id":    "",
+					"build_type":               "release",
+					"encrypted_msisdn":         "",
+					"switch_cp_have_seen_suma": 0,
+				}),
+				"server_params": string(jsonParamsStep1),
+			}),
+		}
+
+		step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.async.contactpoint_phone.async"
+		step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.async.contactpoint_phone.async"
+		step1Config.InnerParams = JSONStringify(jsonParamsStep2)
+
+		targetApi = "com.bloks.www.bloks.caa.reg.confirmation.async"
+		paramsStep2, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		if err != nil {
+			logFailureAtomically(workerID, phoneNum, targetApi, "STEP2_FAILED")
+			return false
+		}
+
+		// --- STEP 3: Fetch SMS Code and Verify ---
+		smsTimeout := time.Duration(globalConfig.SMSWaitTimeoutSec) * time.Second
+		code, rawMsg, err := smsMgr.PollCode(phoneNum, smsTimeout, workerID)
+		if err != nil {
+			updateDisplay(workerID, phoneNum, "SMS", "Timeout")
+			// Log as silent failure (don't increment failCount) to allow dispatcher to retry fairly
+			logSilentFailure(phoneNum, "SMS_TIMEOUT")
+			return false
+		}
+		AsyncLog(fmt.Sprintf("[w%d] [%s] SMS Received: %s", workerID, phoneNum, rawMsg))
+
+		jsonParamsStep3 := map[string]any{
+			"params": JSONStringify(map[string]any{
+				"client_input_params": JSONStringify(map[string]any{
+					"confirmed_cp_and_code":  map[string]any{},
+					"aac":                    "",
+					"block_store_machine_id": "",
+					"code":                   code,
+					"fb_ig_device_id":        []any{},
+					"device_id":              step1Config.AndroidID,
+					"lois_settings": map[string]any{
+						"lois_token": "",
+					},
+					"cloud_trust_token": nil,
+					"network_bssid":     nil,
+				}),
+				"server_params": JSONStringify(paramsStep2),
+			}),
+		}
+
+		step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.confirmation.async"
+		step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.confirmation.async"
+		step1Config.InnerParams = JSONStringify(jsonParamsStep3)
+
+		targetApi = "com.bloks.www.bloks.caa.reg.password.async"
+		paramsStep3, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		if err != nil {
+			logFailureAtomically(workerID, phoneNum, targetApi, "STEP3_FAILED")
+			return false
+		}
+
+		passwordLen := rand.Intn(5) + 8
+		password := GenerateRandomPassword(passwordLen)
+		updateDisplay(workerID, phoneNum, "Password", "Encrypting...")
+		timestamp := time.Now().Unix()
+		safetynet_response := "API_ERROR:+class+com.google.android.gms.common.api.ApiException:7:+"
+
+		tokenBytes := make([]byte, 24)
+		crand.Read(tokenBytes)
+		tokenData := fmt.Sprintf("%s|%d|", phoneNum, timestamp)
+		safetynet_token := base64.StdEncoding.EncodeToString(append([]byte(tokenData), tokenBytes...))
+
+		passwordEnd, _, err := EncryptPassword4NodeCompatible(pubKey, keyIdInt, password)
+		// if err != nil {
+		// AsyncLog(fmt.Sprintf("[%s] RSA encryption failed: %v. Using fallback.", phoneNum, err))
+		passwordEnd = fmt.Sprintf("#PWD_INSTAGRAM:0:%d:%s", timestamp, password)
+		// }
+		jsonParamsStepPassword := map[string]any{
+			"params": JSONStringify(map[string]any{
+				"client_input_params": JSONStringify(map[string]any{
+					"safetynet_response":                    safetynet_response,
+					"caa_play_integrity_attestation_result": "",
+					"aac":                                   "",
+					"safetynet_token":                       safetynet_token,
+					"whatsapp_installed_on_client":          0,
+					"zero_balance_state":                    "",
+					"network_bssid":                         nil,
+					"machine_id":                            mid,
+					"headers_last_infra_flow_id_safetynet":  "",
+					"email_oauth_token_map":                 map[string]any{},
+					"block_store_machine_id":                "",
+					"fb_ig_device_id":                       []any{},
+					"encrypted_msisdn_for_safetynet":        "",
+					"lois_settings": map[string]any{
+						"lois_token": "",
+					},
+					"cloud_trust_token":     nil,
+					"client_known_key_hash": "",
+					"encrypted_password":    passwordEnd,
+				}),
+				"server_params": JSONStringify(paramsStep3),
+			}),
+		}
+
+		step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.password.async"
+		step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.password.async"
+		step1Config.InnerParams = JSONStringify(jsonParamsStepPassword)
+
+		targetApi = "com.bloks.www.bloks.caa.reg.birthday.async"
+		paramsStep4, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		if err != nil {
+			logFailureAtomically(workerID, phoneNum, targetApi, "STEP4_FAILED")
+			return false
+		}
+
+		day, month, year := GenerateRandomBirthday(18, 40)
+		birthdayStr := fmt.Sprintf("%02d-%02d-%d", day, month, year)
+		birthDayTimestamp, err := GetTimestampByBirthdayAndTZ(birthdayStr, geoInfo.Timezone)
+		if err != nil {
+			birthDayTimestamp = time.Date(year, time.Month(month), day, 0, 0, 0, 0, time.Local).Unix()
+		}
+
+		AsyncLog(fmt.Sprintf("[w%d] [%s] Starting Step 5...", workerID, phoneNum))
+		jsonParamsStep5 := map[string]any{
+			"params": JSONStringify(map[string]any{
+				"client_input_params": JSONStringify(map[string]any{
+					"client_timezone":                 geoInfo.Timezone,
+					"aac":                             "",
+					"birthday_or_current_date_string": birthdayStr,
+					"os_age_range":                    "",
+					"birthday_timestamp":              birthDayTimestamp,
+					"lois_settings": map[string]any{
+						"lois_token": "",
+					},
+					"zero_balance_state":                "",
+					"network_bssid":                     nil,
+					"should_skip_youth_tos":             0,
+					"is_youth_regulation_flow_complete": 0,
+				}),
+				"server_params": JSONStringify(paramsStep4),
+			}),
+		}
+
+		step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.birthday.async"
+		step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.birthday.async"
+		step1Config.InnerParams = JSONStringify(jsonParamsStep5)
+
+		targetApi = "com.bloks.www.bloks.caa.reg.name_ig_and_soap.async"
+		paramsStep5, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		if err != nil {
+			logFailureAtomically(workerID, phoneNum, targetApi, "STEP5_FAILED")
+			return false
+		}
+
+		AsyncLog(fmt.Sprintf("[w%d] [%s] Starting Step 6...", workerID, phoneNum))
+		jsonParamsStep6 := map[string]any{
+			"params": JSONStringify(map[string]any{
+				"client_input_params": JSONStringify(map[string]any{
+					"accounts_list": []any{},
+					"aac":           "",
+					"lois_settings": map[string]any{
+						"lois_token": "",
+					},
+					"zero_balance_state": "",
+					"network_bssid":      nil,
+					"name":               "",
+				}),
+				"server_params": JSONStringify(paramsStep5),
+			}),
+		}
+
+		step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.name_ig_and_soap.async"
+		step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.name_ig_and_soap.async"
+		step1Config.InnerParams = JSONStringify(jsonParamsStep6)
+
+		targetApi = "com.bloks.www.bloks.caa.reg.username.async"
+		paramsStep6, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		if err != nil {
+			logFailureAtomically(workerID, phoneNum, targetApi, "STEP6_FAILED")
+			return false
+		}
+
+		regInfo := paramsStep6["reg_info"]
+		regInfoMap := make(map[string]any)
+		if regInfo != "" {
+			_ = json.Unmarshal([]byte(regInfo), &regInfoMap)
+		}
+		usernameArg := ""
+		if u, ok := regInfoMap["username_prefill"].(string); ok {
+			usernameArg = u
+		}
+
+		AsyncLog(fmt.Sprintf("[w%d] [%s] Starting Step 7...", workerID, phoneNum))
+		jsonParamsStep7 := map[string]any{
+			"params": JSONStringify(map[string]any{
+				"client_input_params": JSONStringify(map[string]any{
+					"validation_text":  usernameArg,
+					"aac":              "",
+					"family_device_id": step1Config.FamilyDeviceID,
+					"device_id":        step1Config.AndroidID,
+					"lois_settings": map[string]any{
+						"lois_token": "",
+					},
+					"zero_balance_state": "",
+					"network_bssid":      nil,
+					"qe_device_id":       step1Config.DeviceID,
+				}),
+				"server_params": JSONStringify(paramsStep6),
+			}),
+		}
+
+		step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.username.async"
+		step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.username.async"
+		step1Config.InnerParams = JSONStringify(jsonParamsStep7)
+
+		targetApi = "com.bloks.www.bloks.caa.reg.create.account.async"
+		paramsStep7, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		if err != nil {
+			logFailureAtomically(workerID, phoneNum, targetApi, "STEP7_FAILED")
+			return false
+		}
+
+		// Step 8: com.bloks.www.bloks.caa.reg.create.account.async
+		updateDisplay(workerID, phoneNum, "CreateAccount", "Finalizing...")
+		jsonParamsStep8 := map[string]any{
+			"params": JSONStringify(map[string]any{
+				"client_input_params": JSONStringify(map[string]any{
+					"ck_error":                   "",
+					"aac":                        "",
+					"device_id":                  step1Config.AndroidID,
+					"waterfall_id":               step1Config.WaterfallID,
+					"zero_balance_state":         "",
+					"network_bssid":              nil,
+					"failed_birthday_year_count": "",
+					"headers_last_infra_flow_id": "",
+					"ig_partially_created_account_nonce_expiry": 0,
+					"machine_id":                         mid,
+					"should_ignore_existing_login":       0,
+					"reached_from_tos_screen":            1,
+					"ig_partially_created_account_nonce": "",
+					"ck_nonce":                           "",
+					"force_sessionless_nux_experience":   0,
+					"lois_settings": map[string]any{
+						"lois_token": "",
+					},
+					"ig_partially_created_account_user_id": 0,
+					"ck_id":                                "",
+					"no_contact_perm_email_oauth_token":    "",
+					"encrypted_msisdn":                     "",
+				}),
+				"server_params": JSONStringify(paramsStep7),
+			}),
+		}
+
+		step1Config.BloksAppID = "com.bloks.www.bloks.caa.reg.create.account.async"
+		step1Config.FriendlyName = "IGBloksAppRootQuery-com.bloks.www.bloks.caa.reg.create.account.async"
+		step1Config.InnerParams = JSONStringify(jsonParamsStep8)
+
+		if challengeNonce != "" {
+			step1Config.HeaderOverrides = map[string]string{
+				"x-ig-attest-params": fmt.Sprintf(`{"attestation":[{"version":2,"type":"keystore","errors":[-1014],"challenge_nonce":"%s","signed_nonce":"","key_hash":""}]}`, challengeNonce),
+			}
+		}
+
+		for i := 1; i <= finalizeRetries; i++ {
+			if time.Now().After(deadline) {
+				return false
+			}
+			updateDisplay(workerID, phoneNum, "Finalize", fmt.Sprintf("Finalizing (Attempt %d)...", i))
+			paramsStep8, err := PollUntilParamSuccess("", step1Config, 1, 2, 1, workerID, pm)
+			if err != nil {
+				// PollUntilParamSuccess internally rotates IP on error
 				if globalConfig.EnableHeaderRotation {
 					hm.RandomizeWithConfig(enableIOSRotation, globalConfig.EnableAnomalousUA)
 				}
-				// Refresh IP info for display and logging
-				if info, err := GetIPAndTimezone(pm.GetProxyWithConn(workerID)); err == nil {
-					geoInfo = info
-					displayMu.Lock()
-					workerIPs[workerID] = info.IP
-					displayMu.Unlock()
-				}
-				time.Sleep(time.Second * 3)
 				continue
 			}
 
-			// Success!
-			// Format: username:password|User-Agent|android_id;device_id;family_device_id;waterfall_id|X-MID=mid;sessionid=sid;IG-U-DS-USER-ID=pkid;Authorization=token;|||
-			ua := hm.Headers["user-agent"]
-			ids := fmt.Sprintf("%s;%s;%s;%s", AndroidID, DeviceID, FamilyDeviceID, WaterfallID)
-			authString := fmt.Sprintf("X-MID=%s;sessionid=%s;IG-U-DS-USER-ID=%s;Authorization=%s;", mid, finalSessionID, finalPKID, finalToken)
+			if paramsStep8 != nil {
+				body := paramsStep8["full_response"]
+				finalUsername, finalToken, finalPKID, finalSessionID, _, fbidV2 := ExtractTokenAndUsername(body)
 
-			resultLine := fmt.Sprintf("%s:%s|%s|%s|%s;done:%d|||", finalUsername, password, ua, ids, authString, i)
-			logSuccessAtomically(resultLine)
+				// Reject usernames containing "Instagram User"
+				if strings.Contains(finalUsername, "Instagram User") {
+					logFailureAtomically(workerID, phoneNum, "Finalize", "Instagram User detected")
+					continue
+				}
 
-			// Increment and save success count for this phone
-			dataMu.Lock()
-			phoneRegCounts[phoneNum]++
-			newCount := phoneRegCounts[phoneNum]
-			dataMu.Unlock()
-			saveBackup(phoneNum, newCount)
+				// If response tells us to try again or we failed to get registration tokens
+				if strings.Contains(body, "Please try again") || finalUsername == "" || finalToken == "" {
+					uaType := "UA"
+					if enableIOSRotation {
+						uaType = "iOS UA"
+					}
+					updateDisplay(workerID, phoneNum, "Finalize", fmt.Sprintf("Failed, rotating IP & %s...", uaType))
+					RotateClientProxy(client, pm, workerID)
 
-			// Force a display refresh to show the incremented Success: total and phone [1/1]
-			updateDisplay(workerID, phoneNum, "DONE", fmt.Sprintf("SUCCESS (done:%d)", i))
+					if globalConfig.EnableHeaderRotation {
+						hm.RandomizeWithConfig(enableIOSRotation, globalConfig.EnableAnomalousUA)
+					}
+					// Refresh IP info for display and logging
+					if info, err := GetIPAndTimezone(pm.GetProxyWithConn(workerID)); err == nil {
+						geoInfo = info
+						displayMu.Lock()
+						workerIPs[workerID] = info.IP
+						displayMu.Unlock()
+					}
+					time.Sleep(time.Second * 3)
+					continue
+				}
 
-			success = true
-			break
+				// Success!
+				// Format: username:password|User-Agent|android_id;device_id;family_device_id;waterfall_id|X-MID=mid;sessionid=sid;IG-U-DS-USER-ID=pkid;Authorization=token;|||
+				ua := hm.Headers["user-agent"]
+				ids := fmt.Sprintf("%s;%s;%s;%s", AndroidID, DeviceID, FamilyDeviceID, WaterfallID)
+				authString := fmt.Sprintf("X-MID=%s;sessionid=%s;IG-U-DS-USER-ID=%s;Authorization=%s;fbid_v2=%s;", mid, finalSessionID, finalPKID, finalToken, fbidV2)
+
+				resultLine := fmt.Sprintf("%s:%s|%s|%s|%s;done:%d|||", finalUsername, password, ua, ids, authString, i)
+				logSuccessAtomically(resultLine)
+
+				// Increment and save success count for this phone
+				dataMu.Lock()
+				phoneRegCounts[phoneNum]++
+				newCount := phoneRegCounts[phoneNum]
+				dataMu.Unlock()
+				saveBackup(phoneNum, newCount)
+
+				// Force a display refresh to show the incremented Success: total and phone [1/1]
+				updateDisplay(workerID, phoneNum, "DONE", fmt.Sprintf("SUCCESS (done:%d)", i))
+
+				return true
+			}
+			time.Sleep(time.Second * 2)
 		}
-		time.Sleep(time.Second * 2)
 	}
 
-	if !success {
-		logFailureAtomically(workerID, phoneNum, "Finalize", "STEP8_FAILED")
-	}
-
-	return success
+	logFailureAtomically(workerID, phoneNum, "Finalize", "ALL_RETRY_ATTEMPTS_FAILED")
+	return false
 }
