@@ -657,6 +657,7 @@ type AppConfig struct {
 	TotalSuccessLimit     int  `json:"total_success_limit"`
 	HttpRequestTimeoutSec int  `json:"http_request_timeout_sec"`
 	EnableAnomalousUA     bool `json:"enable_anomalous_ua"`
+	EnableAuto2FA         bool `json:"enable_auto_2fa"`
 }
 
 var (
@@ -691,6 +692,8 @@ var (
 
 	apiSem chan struct{} // Throttler for Instagram API
 	smsSem chan struct{} // Throttler for SMS API
+
+	globalIgTracker *IgProcessedTracker
 
 	phoneRegCounts        = make(map[string]int)  // Current successful reg count per phone (from backup)
 	phoneMaxCounts        = make(map[string]int)  // Max count allowed per phone (from reg.txt)
@@ -960,6 +963,8 @@ func loadEnvConfig() {
 			}
 		case "ENABLE_ANOMALOUS_UA":
 			globalConfig.EnableAnomalousUA = strings.EqualFold(valStr, "true") || valStr == "1"
+		case "ENABLE_AUTO_2FA":
+			globalConfig.EnableAuto2FA = strings.EqualFold(valStr, "true") || valStr == "1"
 		}
 	}
 }
@@ -1086,6 +1091,10 @@ func main() {
 		return
 	}
 	totalPhones = len(smsMgr.Configs)
+
+	if globalConfig.EnableAuto2FA {
+		globalIgTracker, _ = NewIgProcessedTracker()
+	}
 
 	pm, err := NewProxyManager("proxy.txt")
 	if err != nil {
@@ -1745,6 +1754,27 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 				authString := fmt.Sprintf("X-MID=%s;sessionid=%s;IG-U-DS-USER-ID=%s;Authorization=%s;fbid_v2=%s;", mid, finalSessionID, finalPKID, finalToken, fbidV2)
 
 				resultLine := fmt.Sprintf("%s:%s|%s|%s|%s;done:%d|||", finalUsername, password, ua, ids, authString, i)
+				// --- AUTO 2FA ---
+				has2FA := false
+				if globalConfig.EnableAuto2FA && globalIgTracker != nil {
+					updateDisplay(workerID, phoneNum, "2FA", "Enabling 2FA...")
+					hm_ig := NewInstagramHeaderManager()
+					api_ig := NewInstagramApi(client, hm_ig)
+					if err := api_ig.InitSession(resultLine); err == nil {
+						if secret, err := api_ig.Automate2FA(); err == nil {
+							globalIgTracker.SaveSuccess(finalUsername, password, secret)
+							resultLine = fmt.Sprintf("%s|2fa:%s", resultLine, secret)
+							has2FA = true
+						} else {
+							fmt.Printf("[%d] [%s] 2FA Enable Failed: %v\n", workerID, phoneNum, err)
+							globalIgTracker.SaveFail(finalUsername, resultLine, fmt.Sprintf("API_ERROR: %v", err))
+						}
+					} else {
+						fmt.Printf("[%d] [%s] 2FA Session Init Failed: %v\n", workerID, phoneNum, err)
+						globalIgTracker.SaveFail(finalUsername, resultLine, fmt.Sprintf("SESSION_INIT_ERROR: %v", err))
+					}
+				}
+
 				logSuccessAtomically(resultLine)
 
 				// Increment and save success count for this phone
@@ -1754,8 +1784,15 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 				dataMu.Unlock()
 				saveBackup(phoneNum, newCount)
 
-				// Force a display refresh to show the incremented Success: total and phone [1/1]
-				updateDisplay(workerID, phoneNum, "DONE", fmt.Sprintf("SUCCESS (done:%d)", i))
+				if has2FA {
+					updateDisplay(workerID, phoneNum, "DONE", "SUCCESS + 2FA")
+				} else {
+					if globalConfig.EnableAuto2FA {
+						updateDisplay(workerID, phoneNum, "DONE", "SUCCESS (2FA Fail)")
+					} else {
+						updateDisplay(workerID, phoneNum, "DONE", fmt.Sprintf("SUCCESS (done:%d)", i))
+					}
+				}
 
 				return true
 			}
