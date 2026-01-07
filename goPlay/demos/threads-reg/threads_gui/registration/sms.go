@@ -247,3 +247,11 @@ func (s *SMSManager) GetTotalSuccessCount() int {
 	}
 	return total
 }
+
+func (s *SMSManager) ResetStats() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for k := range s.PhoneRegCounts {
+		s.PhoneRegCounts[k] = 0
+	}
+}

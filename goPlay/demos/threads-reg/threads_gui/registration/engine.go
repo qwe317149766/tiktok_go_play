@@ -235,6 +235,8 @@ func (e *RegistrationEngine) RotateClientProxy(client *http.Client, pm *ProxyMan
 		if u, err := url.Parse(newProxy); err == nil {
 			if transport, ok := client.Transport.(*http.Transport); ok {
 				transport.Proxy = http.ProxyURL(u)
+				// Close idle connections to force new connection with new proxy
+				transport.CloseIdleConnections()
 			}
 		}
 	}

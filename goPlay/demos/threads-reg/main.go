@@ -1146,7 +1146,12 @@ func main() {
 		go func(id int) {
 			defer wg.Done()
 
-			transport := &http.Transport{}
+			transport := &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+				DisableKeepAlives:   false,
+			}
 			proxyURL := ""
 			if pm != nil {
 				proxyURL = pm.GetProxyWithConn(id)
@@ -1155,7 +1160,7 @@ func main() {
 				}
 			}
 			client := &http.Client{
-				Timeout:   60 * time.Second,
+				Timeout:   time.Duration(globalConfig.HttpRequestTimeoutSec) * time.Second,
 				Transport: transport,
 			}
 

@@ -60,6 +60,7 @@ func GetDefaultConfig() *AppConfig {
 		EnableAnomalousUA:     false,
 		EnableIOS:             false,
 		HttpRequestTimeoutSec: 30,
+		MaxSuccessPerFile:     0,
 	}
 }
 

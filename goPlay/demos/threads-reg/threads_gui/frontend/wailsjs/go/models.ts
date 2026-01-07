@@ -67,6 +67,7 @@ export namespace config {
 	    login_btn: string;
 	    hardware_id: string;
 	    expiry_date: string;
+	    logout: string;
 	    settings: string;
 	    menu_execution: string;
 	    menu_params: string;
@@ -113,6 +114,15 @@ export namespace config {
 	    cookie_path_title: string;
 	    under_dev: string;
 	    proxy_source: string;
+	    alert_task_completed: string;
+	    alert_login_failed: string;
+	    alert_select_file: string;
+	    alert_settings_saved: string;
+	    alert_settings_save_failed: string;
+	    alert_api_success: string;
+	    alert_api_failed: string;
+	    confirm_clear_stats: string;
+	    confirm_delete_file: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new LanguagePack(source);
@@ -126,6 +136,7 @@ export namespace config {
 	        this.login_btn = source["login_btn"];
 	        this.hardware_id = source["hardware_id"];
 	        this.expiry_date = source["expiry_date"];
+	        this.logout = source["logout"];
 	        this.settings = source["settings"];
 	        this.menu_execution = source["menu_execution"];
 	        this.menu_params = source["menu_params"];
@@ -172,6 +183,15 @@ export namespace config {
 	        this.cookie_path_title = source["cookie_path_title"];
 	        this.under_dev = source["under_dev"];
 	        this.proxy_source = source["proxy_source"];
+	        this.alert_task_completed = source["alert_task_completed"];
+	        this.alert_login_failed = source["alert_login_failed"];
+	        this.alert_select_file = source["alert_select_file"];
+	        this.alert_settings_saved = source["alert_settings_saved"];
+	        this.alert_settings_save_failed = source["alert_settings_save_failed"];
+	        this.alert_api_success = source["alert_api_success"];
+	        this.alert_api_failed = source["alert_api_failed"];
+	        this.confirm_clear_stats = source["confirm_clear_stats"];
+	        this.confirm_delete_file = source["confirm_delete_file"];
 	    }
 	}
 

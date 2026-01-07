@@ -30,6 +30,7 @@ type App struct {
 	cancelFunc context.CancelFunc
 	mu         sync.Mutex
 	proxyMgr   *registration.ProxyManager
+	smsMgr     *registration.SMSManager
 	logChan    chan map[string]interface{}
 	statsChan  chan map[string]interface{}
 }
@@ -199,6 +200,10 @@ func (a *App) RunRegistration(params map[string]interface{}) {
 		// 1. Initialize SMS Manager (inside background)
 		a.Log("[System] Initializing SMS manager...")
 		smsMgr := registration.NewSMSManager()
+		a.mu.Lock()
+		a.smsMgr = smsMgr
+		a.mu.Unlock()
+
 		if a.config.SmsFile == "" {
 			a.Log("[Error] No SMS file selected in settings.")
 			wailsRuntime.EventsEmit(a.ctx, "engine_status", "stopped")
@@ -279,13 +284,14 @@ func (a *App) RunRegistration(params map[string]interface{}) {
 		var failCnt int64
 
 		regConf := registration.RegConfig{
-			PollTimeoutSec:       a.config.PollTimeoutSec,
-			SMSWaitTimeoutSec:    a.config.SMSWaitTimeoutSec,
-			EnableAuto2FA:        a.config.Auto2FA,
-			FinalizeRetries:      a.config.FinalizeRetries,
-			EnableHeaderRotation: a.config.EnableHeaderRotation,
-			EnableAnomalousUA:    a.config.EnableAnomalousUA,
-			EnableIOS:            a.config.EnableIOS,
+			PollTimeoutSec:        a.config.PollTimeoutSec,
+			SMSWaitTimeoutSec:     a.config.SMSWaitTimeoutSec,
+			EnableAuto2FA:         a.config.Auto2FA,
+			FinalizeRetries:       a.config.FinalizeRetries,
+			EnableHeaderRotation:  a.config.EnableHeaderRotation,
+			EnableAnomalousUA:     a.config.EnableAnomalousUA,
+			EnableIOS:             a.config.EnableIOS,
+			HTTPRequestTimeoutSec: a.config.HttpRequestTimeoutSec,
 		}
 
 		wailsRuntime.EventsEmit(a.ctx, "stats", map[string]interface{}{
@@ -313,6 +319,17 @@ func (a *App) RunRegistration(params map[string]interface{}) {
 
 			if a.config.MaxRegCount > 0 && smsMgr.GetTotalSuccessCount() >= a.config.MaxRegCount {
 				a.Log("[System] Max registration count reached. Stopping...")
+				langCode := a.config.Language
+				if langCode == "" {
+					langCode = "en-US"
+				}
+				tmpl := config.Languages[langCode].AlertTaskCompleted
+				if tmpl == "" {
+					tmpl = config.Languages["en-US"].AlertTaskCompleted
+				}
+				wailsRuntime.EventsEmit(a.ctx, "show_alert", fmt.Sprintf(tmpl, a.config.MaxRegCount))
+				wailsRuntime.EventsEmit(a.ctx, "engine_status", "stopped")
+				cancel() // Stop all running workers immediately
 				break SpawnLoop
 			}
 
@@ -331,12 +348,17 @@ func (a *App) RunRegistration(params map[string]interface{}) {
 				}
 
 				currProxy := pm.GetProxyWithConn(wid)
-				transport := &http.Transport{}
+				transport := &http.Transport{
+					MaxIdleConns:        100,
+					MaxIdleConnsPerHost: 10,
+					IdleConnTimeout:     90 * time.Second,
+					DisableKeepAlives:   false, // Explicitly ensure Keep-Alive is ON
+				}
 				if proxyURL, err := url.Parse(currProxy); err == nil {
 					transport.Proxy = http.ProxyURL(proxyURL)
 				}
 				client := &http.Client{
-					Timeout:   3 * time.Minute, // Increased timeout for long polling
+					Timeout:   time.Duration(a.config.HttpRequestTimeoutSec) * time.Second,
 					Transport: transport,
 				}
 
@@ -420,16 +442,22 @@ func (a *App) saveResult(dir, phone, content string, is2FA bool, currentTotal in
 	os.MkdirAll(dir, 0755)
 
 	maxPerFile := int64(a.config.MaxSuccessPerFile)
+	var filename string
+
 	if maxPerFile <= 0 {
-		maxPerFile = 100
+		// Unlimited: Single file per day
+		filename = fmt.Sprintf("%s-注册成功.txt", time.Now().Format("2006-01-02"))
+	} else {
+		fileIdx := (currentTotal / maxPerFile) + 1
+		filename = fmt.Sprintf("%s-注册成功-%d.txt", time.Now().Format("2006-01-02"), fileIdx)
 	}
-	fileIdx := (currentTotal / maxPerFile) + 1
-	filename := fmt.Sprintf("%s-注册成功-%d.txt", time.Now().Format("2006-01-02"), fileIdx)
+
 	fullPath := filepath.Join(dir, filename)
 
 	f, err := os.OpenFile(fullPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err == nil {
 		defer f.Close()
+		content = strings.ReplaceAll(content, "Barcelona", "Instagram")
 		f.WriteString(content + "\n")
 	}
 }
@@ -440,6 +468,27 @@ func (a *App) appendBackup(phone string, count int) {
 		defer f.Close()
 		f.WriteString(fmt.Sprintf("%s----%d\n", phone, count))
 	}
+}
+
+func (a *App) ResetTotalStats() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	// 1. Reset Memory Stats
+	if a.smsMgr != nil {
+		a.smsMgr.ResetStats()
+	}
+
+	// 2. Clear Backup File
+	os.WriteFile("reg_backup.txt", []byte(""), 0644)
+
+	// 3. Emit update
+	a.statsChan <- map[string]interface{}{
+		"success":       0,
+		"failed":        0,
+		"total_success": 0,
+	}
+	a.Log("[System] Total statistics and backup cleared.")
 }
 
 func (a *App) saveFailure(phone, reason string, workerID int) {
@@ -456,16 +505,6 @@ func (a *App) saveFailure(phone, reason string, workerID int) {
 	if err == nil {
 		defer f.Close()
 		f.WriteString(content + "\n")
-	}
-}
-
-func (a *App) StopRegistration() {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.cancelFunc != nil {
-		a.cancelFunc()
-		a.cancelFunc = nil
-		a.Log("[System] Stopping engine...")
 	}
 }
 
@@ -580,4 +619,21 @@ func (a *App) TestAPIPushURL(url string) bool {
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+func (a *App) StopRegistration() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.cancelFunc != nil {
+		a.Log("[System] Stopping registration engine (User Request)...")
+		a.cancelFunc()
+		a.cancelFunc = nil
+	} else {
+		// If already stopped (or nil), ensure frontend knows it's stopped
+		a.Log("[System] Engine is not running (Force Stop).")
+	}
+
+	// Always emit stopped status to unblock frontend UI
+	wailsRuntime.EventsEmit(a.ctx, "engine_status", "stopped")
 }

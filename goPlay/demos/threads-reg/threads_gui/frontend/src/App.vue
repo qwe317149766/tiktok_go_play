@@ -1,6 +1,18 @@
 <script setup>
 import { reactive, onMounted, onUnmounted, watch, ref, computed, nextTick } from 'vue'
-import { CheckLogin, SelectFile, SelectDirectory, RunRegistration, GetLanguagePack, SetLanguage, TestAPIPushURL, GetConfig, UpdateConfig, GetArchives, OpenFolder, OpenFile, DeleteArchive, StopRegistration, GetTotalStats } from '../wailsjs/go/main/App'
+import { CheckLogin, SelectFile, SelectDirectory, RunRegistration, GetLanguagePack, SetLanguage, TestAPIPushURL, GetConfig, UpdateConfig, GetArchives, OpenFolder, OpenFile, DeleteArchive, StopRegistration, GetTotalStats, ResetTotalStats } from '../wailsjs/go/main/App'
+
+// ... (existing code)
+
+function resetStats() {
+  if (confirm(state.i18n.confirm_clear_stats)) {
+    ResetTotalStats()
+    // Optimistic update
+    state.stats.total_success = 0
+    state.stats.success = 0
+    state.stats.failed = 0
+  }
+}
 import { EventsOn } from '../wailsjs/runtime'
 
 const state = reactive({
@@ -47,7 +59,7 @@ const debounce = (fn, delay) => {
   }
 }
 
-// Virtual Scroll Logic
+// --- Virtual Scroll: Logs ---
 const logViewRef = ref(null)
 const scrollTop = ref(0)
 const containerHeight = ref(0)
@@ -89,6 +101,41 @@ const updateContainerHeight = () => {
   if (logViewRef.value) {
     containerHeight.value = logViewRef.value.clientHeight
   }
+  if (archiveViewRef.value) {
+    archiveContainerHeight.value = archiveViewRef.value.clientHeight
+  }
+}
+
+// --- Virtual Scroll: Archives ---
+const archiveViewRef = ref(null)
+const archiveScrollTop = ref(0)
+const archiveContainerHeight = ref(0)
+const archiveItemHeight = 73 // Approximate height of a row
+const archiveVisible = computed(() => {
+  const total = state.archives.length
+  
+  if (archiveContainerHeight.value === 0) return { items: [], paddingTop: 0, paddingBottom: 0 }
+
+  const start = Math.floor(archiveScrollTop.value / archiveItemHeight)
+  const visibleCount = Math.ceil(archiveContainerHeight.value / archiveItemHeight)
+  const buffer = 5
+  
+  const startIndex = Math.max(0, start - buffer)
+  const endIndex = Math.min(total, start + visibleCount + buffer)
+  
+  const paddingTop = startIndex * archiveItemHeight
+  const paddingBottom = (total - endIndex) * archiveItemHeight
+  
+  return {
+    items: state.archives.slice(startIndex, endIndex),
+    paddingTop,
+    paddingBottom,
+    startIndex
+  }
+})
+
+const onArchiveScroll = (e) => {
+    archiveScrollTop.value = e.target.scrollTop
 }
 
 const themes = {
@@ -153,7 +200,16 @@ onMounted(async () => {
       param_desc: "Configuration parameters",
       card_code: "Card Code",
       login_desc: "Please login to continue",
-      hardware_id: "Hardware ID"
+      hardware_id: "Hardware ID",
+      alert_task_completed: "Task Completed: Max limit of %d reached.",
+      alert_login_failed: "Login Failed: ",
+      alert_select_file: "Please select input file",
+      alert_settings_saved: "Settings saved successfully",
+      alert_settings_save_failed: "Failed to save settings",
+      alert_api_success: "API Connection Successful!",
+      alert_api_failed: "API Connection Failed. Please check the logs.",
+      confirm_clear_stats: "Are you sure you want to clear all statistics?",
+      confirm_delete_file: "Are you sure you want to delete this file?"
     }
   }
   
@@ -227,6 +283,10 @@ onMounted(async () => {
     }
   })
 
+  EventsOn("show_alert", (msg) => {
+    alert(msg)
+  })
+
   // Listen for stats
   EventsOn("stats", (data) => {
     state.stats.success = data.success
@@ -248,7 +308,7 @@ function fetchArchives() {
 }
 
 function deleteFile(path) {
-  if (confirm(state.lang === 'zh-CN' ? '确定要删除这个文件吗？' : 'Are you sure you want to delete this file?')) {
+  if (confirm(state.i18n.confirm_delete_file)) {
     DeleteArchive(path).then(success => {
       if (success) fetchArchives()
     })
@@ -269,9 +329,9 @@ function chooseSuccessDir() {
 function saveConfig() {
   UpdateConfig(state.config).then(success => {
     if (success) {
-      alert("Settings saved successfully")
+      alert(state.i18n.alert_settings_saved)
     } else {
-      alert("Failed to save settings")
+      alert(state.i18n.alert_settings_save_failed)
     }
   })
 }
@@ -298,9 +358,9 @@ function testPushURL() {
   if (!state.config.push_url) return
   TestAPIPushURL(state.config.push_url).then(success => {
     if (success) {
-      alert("API Connection Successful!")
+      alert(state.i18n.alert_api_success)
     } else {
-      alert("API Connection Failed. Please check the logs.")
+      alert(state.i18n.alert_api_failed)
     }
   })
 }
@@ -320,17 +380,34 @@ watch(() => state.config, () => {
   autoSaveConfig()
 }, { deep: true })
 
-function handleLogin() {
-  if (!state.cardCode) return
-  CheckLogin(state.cardCode).then(result => {
-    if (result.success) {
-      state.isLoggedIn = true
-      state.expiryDate = result.expiry
-      state.mid = result.mid
-    } else {
-      alert("Login Failed: " + result.error)
-    }
-  })
+
+const loginTransition = ref(false)
+const dashboardEnter = ref(false)
+
+function performLogin() {
+    if (!state.cardCode) return
+    
+    // Start exit animation
+    loginTransition.value = true
+    
+    CheckLogin(state.cardCode).then(result => {
+        if (result.success) {
+            // Wait for exit animation
+            setTimeout(() => {
+                state.isLoggedIn = true
+                state.expiryDate = result.expiry
+                state.mid = result.mid
+                
+                // Start dashboard entrance
+                setTimeout(() => {
+                    dashboardEnter.value = true
+                }, 100)
+            }, 800)
+        } else {
+            loginTransition.value = false
+            alert(state.i18n.alert_login_failed + result.error)
+        }
+    })
 }
 
 function chooseSmsFile() {
@@ -361,11 +438,11 @@ const toggleEngine = debounce(async () => {
   } else {
     // Start Engine
     if (state.config.reg_mode === 'sms' && !state.config.sms_file) {
-      alert("Please select input file")
+      alert(state.i18n.alert_select_file)
       return
     }
     if (state.config.reg_mode === 'email' && !state.config.email_file) {
-      alert("Please select input file")
+      alert(state.i18n.alert_select_file)
       return
     }
 
@@ -383,33 +460,45 @@ const toggleEngine = debounce(async () => {
 <template>
   <div class="app-container min-h-screen flex flex-col font-sans text-slate-200">
     <!-- Login Screen -->
-    <div v-if="!state.isLoggedIn" class="flex-grow flex items-center justify-center p-4">
-      <div class="glass p-8 rounded-3xl w-full max-w-md shadow-2xl border border-white/10">
+    <!-- Login Screen -->
+    <div v-if="!state.isLoggedIn" class="flex-grow flex items-center justify-center p-4 overflow-hidden relative">
+      <!-- Animated Background Elements -->
+      <div class="absolute top-0 left-0 w-full h-full overflow-hidden pointer-events-none">
+          <div class="absolute top-[-20%] left-[-10%] w-[50%] h-[50%] rounded-full bg-indigo-500/20 blur-[120px] animate-blob"></div>
+          <div class="absolute bottom-[-20%] right-[-10%] w-[50%] h-[50%] rounded-full bg-violet-500/20 blur-[120px] animate-blob animation-delay-2000"></div>
+          <div class="absolute top-[40%] left-[40%] w-[30%] h-[30%] rounded-full bg-emerald-500/10 blur-[100px] animate-blob animation-delay-4000"></div>
+      </div>
+
+      <div 
+        :class="loginTransition ? 'scale-150 opacity-0 blur-xl' : 'scale-100 opacity-100 blur-0'"
+        class="glass p-8 rounded-3xl w-full max-w-md shadow-2xl border border-white/10 transform transition-all duration-700 ease-in-out z-10 animate-slide-up"
+      >
         <div class="text-center mb-10">
-          <div class="inline-block p-4 rounded-2xl bg-indigo-500/20 mb-4">
+          <div class="inline-block p-4 rounded-2xl bg-indigo-500/20 mb-4 shadow-[0_0_20px_rgba(99,102,241,0.5)] animate-pulse-slow">
             <i class="fas fa-key text-4xl text-indigo-400"></i>
           </div>
-          <h1 class="text-3xl font-bold tracking-tight text-white">{{ state.i18n.login_title }}</h1>
+          <h1 class="text-3xl font-bold tracking-tight text-white drop-shadow-lg">{{ state.i18n.login_title }}</h1>
           <p class="text-slate-400 mt-2">{{ state.i18n.login_desc }}</p>
         </div>
         
         <div class="space-y-6">
-          <div class="space-y-2">
-            <label class="text-xs font-bold text-slate-500 uppercase tracking-widest px-1">{{ state.i18n.card_code }}</label>
+          <div class="space-y-2 group">
+            <label class="text-xs font-bold text-slate-500 uppercase tracking-widest px-1 group-focus-within:text-indigo-400 transition-colors">{{ state.i18n.card_code }}</label>
             <input 
               v-model="state.cardCode" 
               type="text" 
-              class="w-full bg-slate-950/50 border border-slate-700/50 focus:border-indigo-500 rounded-xl py-3 px-4 outline-none transition-all"
+              class="w-full bg-slate-950/50 border border-slate-700/50 focus:border-indigo-500 rounded-xl py-3 px-4 outline-none transition-all shadow-inner focus:shadow-[0_0_15px_rgba(99,102,241,0.3)]"
               placeholder="••••••••••••••••"
-              @keyup.enter="handleLogin"
+              @keyup.enter="performLogin"
             >
           </div>
           
-          <button @click="handleLogin" class="w-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 py-3 rounded-xl font-bold shadow-lg shadow-indigo-500/20 transform active:scale-95 transition-all">
-            {{ state.i18n.login_btn }}
+          <button @click="performLogin" class="w-full bg-gradient-to-r from-indigo-600 to-violet-600 hover:from-indigo-500 hover:to-violet-500 py-3 rounded-xl font-bold shadow-lg shadow-indigo-500/20 transform active:scale-95 transition-all relative overflow-hidden group">
+            <span class="relative z-10">{{ state.i18n.login_btn }}</span>
+            <div class="absolute inset-0 bg-white/20 translate-y-full group-hover:translate-y-0 transition-transform duration-300"></div>
           </button>
           
-          <div class="text-[10px] text-slate-600 text-center uppercase tracking-[0.2em] mt-8 bg-black/20 py-2 rounded-lg">
+          <div class="text-[10px] text-slate-600 text-center uppercase tracking-[0.2em] mt-8 bg-black/20 py-2 rounded-lg backdrop-blur-sm">
             {{ state.i18n.hardware_id }} {{ state.mid }}
           </div>
         </div>
@@ -417,12 +506,20 @@ const toggleEngine = debounce(async () => {
     </div>
 
     <!-- Main Dashboard -->
-    <div v-else class="flex-grow flex flex-row overflow-hidden">
+    <div 
+        v-else 
+        :class="dashboardEnter ? 'opacity-100 scale-100 translate-y-0' : 'opacity-0 scale-95 translate-y-10'"
+        class="flex-grow flex flex-row overflow-hidden transition-all duration-700 ease-out"
+    >
       <!-- Sidebar -->
       <aside class="w-48 shrink-0 glass border-r border-white/5 flex flex-col p-6 space-y-8">
         <div class="space-y-1">
           <h2 class="text-xs font-bold text-indigo-400 uppercase tracking-widest">{{ state.i18n.settings }}</h2>
           <p class="text-[10px] text-slate-500 font-mono">{{ state.i18n.expiry_date }}: {{ state.expiryDate }}</p>
+          <button @click="state.isLoggedIn = false; state.cardCode = ''; loginTransition = false; dashboardEnter = false" class="text-[10px] text-rose-400 hover:text-rose-300 font-bold uppercase tracking-widest mt-2 flex items-center space-x-1 cursor-pointer transition-colors">
+            <i class="fas fa-sign-out-alt"></i>
+            <span>{{ state.i18n.logout }}</span>
+          </button>
         </div>
 
         <nav class="space-y-2 flex-grow">
@@ -486,9 +583,12 @@ const toggleEngine = debounce(async () => {
                 <span class="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">{{ state.i18n.stats_failed }}</span>
                 <span class="text-3xl font-black text-rose-400 tabular-nums">{{ state.stats.failed }}</span>
               </div>
-              <div class="glass p-5 rounded-2xl min-w-[120px] border border-white/5">
+              <div class="glass p-5 rounded-2xl min-w-[120px] border border-white/5 relative group">
                 <span class="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">{{ state.i18n.stats_total }}</span>
                 <span class="text-3xl font-black text-indigo-400 tabular-nums">{{ state.stats.total_success }}</span>
+                <button @click="resetStats" class="absolute top-2 right-2 p-1.5 text-slate-600 hover:text-rose-400 hover:bg-rose-400/10 rounded-lg opacity-0 group-hover:opacity-100 transition-all cursor-pointer" :title="state.i18n.logs_clear">
+                  <i class="fas fa-trash-alt text-xs"></i>
+                </button>
               </div>
             </div>
 
@@ -796,13 +896,13 @@ const toggleEngine = debounce(async () => {
                </div>
             </div>
 
-            <div class="flex-grow overflow-y-auto rounded-2xl border border-white/5 bg-black/20">
-              <table class="w-full text-left text-xs border-collapse">
-                <thead class="sticky top-0 bg-slate-900 shadow-xl z-10">
+            <div ref="archiveViewRef" @scroll="onArchiveScroll" class="flex-grow overflow-y-auto rounded-2xl border border-white/5 bg-black/20 custom-scroll-light">
+              <table class="w-full text-left text-xs border-collapse relative">
+                <thead class="sticky top-0 bg-slate-900/90 backdrop-blur-md shadow-xl z-20">
                   <tr class="text-slate-500 uppercase tracking-widest font-bold">
-                    <th class="p-4 border-b border-white/5">File Name</th>
-                    <th class="p-4 border-b border-white/5">Date Modified</th>
-                    <th class="p-4 border-b border-white/5">Size</th>
+                    <th class="p-4 border-b border-white/5 w-1/3">File Name</th>
+                    <th class="p-4 border-b border-white/5 w-1/4">Date Modified</th>
+                    <th class="p-4 border-b border-white/5 w-1/6">Size</th>
                     <th class="p-4 border-b border-white/5 text-right">Action</th>
                   </tr>
                 </thead>
@@ -810,10 +910,18 @@ const toggleEngine = debounce(async () => {
                   <tr v-if="state.archives.length === 0">
                     <td colspan="4" class="p-10 text-center text-slate-600 italic">No records found yet.</td>
                   </tr>
-                  <tr v-for="file in state.archives" :key="file.path" class="hover:bg-white/5 transition-colors group">
+                  
+                  <!-- Virtual Spacer Top -->
+                   <tr v-if="archiveVisible.paddingTop > 0">
+                     <td colspan="4" :style="{ height: archiveVisible.paddingTop + 'px' }"></td>
+                   </tr>
+
+                  <tr v-for="file in archiveVisible.items" :key="file.path" class="hover:bg-white/5 transition-colors group h-[73px]">
                     <td class="p-4 font-mono text-slate-300">
-                      <i class="far fa-file-alt mr-2 text-indigo-400 opacity-50"></i>
-                      {{ file.name }}
+                      <div class="flex items-center">
+                          <i class="far fa-file-alt mr-3 text-indigo-400 opacity-50 group-hover:text-indigo-400 group-hover:opacity-100 group-hover:scale-110 transition-all"></i>
+                          <span class="truncate">{{ file.name }}</span>
+                      </div>
                     </td>
                     <td class="p-4 text-slate-500">{{ file.time }}</td>
                     <td class="p-4 text-slate-500">{{ (file.size / 1024).toFixed(1) }} KB</td>
@@ -828,6 +936,12 @@ const toggleEngine = debounce(async () => {
                       </div>
                     </td>
                   </tr>
+
+                  <!-- Virtual Spacer Bottom -->
+                   <tr v-if="archiveVisible.paddingBottom > 0">
+                     <td colspan="4" :style="{ height: archiveVisible.paddingBottom + 'px' }"></td>
+                   </tr>
+
                 </tbody>
               </table>
             </div>
@@ -853,6 +967,48 @@ const toggleEngine = debounce(async () => {
     </div>
   </div>
 </template>
+
+<style>
+@keyframes blob {
+  0% { transform: translate(0px, 0px) scale(1); }
+  33% { transform: translate(30px, -50px) scale(1.1); }
+  66% { transform: translate(-20px, 20px) scale(0.9); }
+  100% { transform: translate(0px, 0px) scale(1); }
+}
+.animate-blob {
+  animation: blob 7s infinite;
+}
+.animation-delay-2000 {
+  animation-delay: 2s;
+}
+.animation-delay-4000 {
+  animation-delay: 4s;
+}
+@keyframes slide-up {
+    from { opacity: 0; transform: translateY(20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+.animate-slide-up {
+    animation: slide-up 1s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+.animate-pulse-slow {
+    animation: pulse 3s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+/* Scrollbar improvements */
+.custom-scroll-light::-webkit-scrollbar {
+  width: 6px;
+}
+.custom-scroll-light::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.02);
+}
+.custom-scroll-light::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 10px;
+}
+.custom-scroll-light::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+</style>
 
 <style>
 /* Reset and Globals */

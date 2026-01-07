@@ -38,6 +38,10 @@ export function OpenFolder(arg1) {
   return window['go']['main']['App']['OpenFolder'](arg1);
 }
 
+export function ResetTotalStats() {
+  return window['go']['main']['App']['ResetTotalStats']();
+}
+
 export function RunRegistration(arg1) {
   return window['go']['main']['App']['RunRegistration'](arg1);
 }

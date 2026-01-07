@@ -19,13 +19,14 @@ import (
 
 // RegConfig defines configuration for registration worker
 type RegConfig struct {
-	PollTimeoutSec       int
-	SMSWaitTimeoutSec    int
-	EnableHeaderRotation bool
-	EnableAnomalousUA    bool
-	EnableAuto2FA        bool
-	FinalizeRetries      int
-	EnableIOS            bool
+	PollTimeoutSec        int
+	SMSWaitTimeoutSec     int
+	EnableHeaderRotation  bool
+	EnableAnomalousUA     bool
+	EnableAuto2FA         bool
+	FinalizeRetries       int
+	EnableIOS             bool
+	HTTPRequestTimeoutSec int
 }
 
 // ExecuteMobileConfig executes the sessionless mobileconfig request
