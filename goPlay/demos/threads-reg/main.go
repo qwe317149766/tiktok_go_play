@@ -556,7 +556,8 @@ func RotateClientProxy(client *http.Client, pm *ProxyManager, workerID int) stri
 	if pm == nil || client == nil {
 		return ""
 	}
-	newProxy := pm.GetProxyWithConn(workerID)
+	// Use random ID for rotation to ensure tunnel proxy switches IP
+	newProxy := pm.GetRandomProxy()
 	if t, ok := client.Transport.(*http.Transport); ok {
 		if u, err := url.Parse(newProxy); err == nil {
 			t.Proxy = http.ProxyURL(u)
@@ -625,6 +626,9 @@ func (pm *ProxyManager) GetNext() string {
 
 func (pm *ProxyManager) GetProxyWithConn(connID int) string {
 	base := pm.GetNext()
+	if base == "" {
+		return ""
+	}
 	u, err := url.Parse(base)
 	if err != nil {
 		return base
@@ -640,6 +644,14 @@ func (pm *ProxyManager) GetProxyWithConn(connID int) string {
 		}
 	}
 	return u.String()
+}
+
+func (pm *ProxyManager) GetRandomProxy() string {
+	if len(pm.Proxies) == 0 {
+		return ""
+	}
+	randomID := rand.Intn(1000000)
+	return pm.GetProxyWithConn(randomID)
 }
 
 type AppConfig struct {
