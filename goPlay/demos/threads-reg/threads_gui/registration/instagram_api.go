@@ -300,6 +300,9 @@ func (api *InstagramApi) TwoFactor() (string, error) {
 	if api.AuthHeader == "" {
 		return "", fmt.Errorf("session not initialized: missing Authorization header")
 	}
+	if api.HeaderManager == nil {
+		api.HeaderManager = NewInstagramHeaderManager()
+	}
 
 	if api.FbidV2 == "" {
 		if api.DsUserID == "" {
@@ -526,7 +529,7 @@ func (api *InstagramApi) Automate2FA() (string, error) {
 		return "", fmt.Errorf("TotpCompletion status not ok: %s", cpResp)
 	}
 
-	return tfResp.KeyText, nil
+	return strings.ReplaceAll(tfResp.KeyText, " ", ""), nil
 }
 
 func GenerateRandomString(n int) string {

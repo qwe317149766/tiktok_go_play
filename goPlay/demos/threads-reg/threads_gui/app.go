@@ -37,11 +37,20 @@ type App struct {
 
 // NewApp creates a new App struct
 func NewApp() *App {
-	return &App{
+	app := &App{
 		config:    config.LoadConfig(),
 		logChan:   make(chan map[string]interface{}, 5000),
 		statsChan: make(chan map[string]interface{}, 100),
 	}
+
+	// Apply CPU-based concurrency default if config default (100) or 0
+	// We want to force CPU*22 unless explicitly customized to something else non-default?
+	// Or just update the default logic.
+	// A safer bet is to update the LoadConfig in config.go, but modifying here ensures runtime dynamism.
+	if app.config.Concurrency == 0 || app.config.Concurrency == 100 {
+		app.config.Concurrency = runtime.NumCPU() * 22
+	}
+	return app
 }
 
 // startup is called when the app starts. The context is saved

@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -499,13 +500,13 @@ func ExtractTokenAndUsername(data string) (string, string, string, string, strin
 }
 
 // PollUntilParamSuccess repeatedly calls the API until GetParamsByApiName succeeds or maxRetries is reached
-func PollUntilParamSuccess(targetApi string, cfg ThreadsRequestConfig, minSleepSec, maxSleepSec int, maxRetries int, workerID int, pm *ProxyManager) (map[string]string, error) {
+func PollUntilParamSuccess(targetApi string, cfg ThreadsRequestConfig, minSleepSec, maxSleepSec int, maxRetries int, workerID int, pm *ProxyManager, pollTimeoutSec int) (map[string]string, error) {
 	round := 1
 	consecutiveErrors := 0
 	rand.Seed(time.Now().UnixNano())
 
 	startTime := time.Now()
-	timeout := time.Duration(globalConfig.PollTimeoutSec) * time.Second
+	timeout := time.Duration(pollTimeoutSec) * time.Second
 
 	for {
 		if time.Since(startTime) > timeout {
@@ -1118,6 +1119,9 @@ func main() {
 		phoneList = append(phoneList, p)
 	}
 
+	// Calculate concurrency based on CPU * 22
+	concurrencyLimit = runtime.NumCPU() * 22
+
 	// Initialize semaphores for decoupling
 	apiSem = make(chan struct{}, concurrencyLimit)
 	smsSem = make(chan struct{}, globalConfig.SMSMaxParallel)
@@ -1135,8 +1139,8 @@ func main() {
 
 	clearScreen()
 	startDisplayRefresher()
-	AsyncLog(fmt.Sprintf("Starting System: ActiveAPI=%d, MaxTotalWorkers=%d, SMSMaxParallel=%d",
-		concurrencyLimit, globalConfig.MaxWorkers, globalConfig.SMSMaxParallel))
+	AsyncLog(fmt.Sprintf("Starting System: CPU=%d, ActiveAPI=%d, MaxTotalWorkers=%d, SMSMaxParallel=%d",
+		runtime.NumCPU(), concurrencyLimit, globalConfig.MaxWorkers, globalConfig.SMSMaxParallel))
 
 	for i := 1; i <= globalConfig.MaxWorkers; i++ {
 		// Initial display placeholder
@@ -1418,7 +1422,7 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 		InnerParamsString, _ := json.Marshal(jsonParams)
 		step1Config.InnerParams = string(InnerParamsString)
 		targetApi := "com.bloks.www.bloks.caa.reg.async.contactpoint_phone.async"
-		paramsStep1, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 5, workerID, pm)
+		paramsStep1, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 5, workerID, pm, globalConfig.PollTimeoutSec)
 		if err != nil {
 			AsyncLog(fmt.Sprintf("[w%d] [%s] Step 1 failed 5 times, resetting identity: %v", workerID, phoneNum, err))
 			continue // Identity Reset: Loop back to start with new IDs and Proxy
@@ -1467,7 +1471,7 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 		step1Config.InnerParams = JSONStringify(jsonParamsStep2)
 
 		targetApi = "com.bloks.www.bloks.caa.reg.confirmation.async"
-		paramsStep2, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		paramsStep2, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm, globalConfig.PollTimeoutSec)
 		if err != nil {
 			logFailureAtomically(workerID, phoneNum, targetApi, "STEP2_FAILED")
 			return false
@@ -1508,7 +1512,7 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 		step1Config.InnerParams = JSONStringify(jsonParamsStep3)
 
 		targetApi = "com.bloks.www.bloks.caa.reg.password.async"
-		paramsStep3, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		paramsStep3, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm, globalConfig.PollTimeoutSec)
 		if err != nil {
 			logFailureAtomically(workerID, phoneNum, targetApi, "STEP3_FAILED")
 			return false
@@ -1562,7 +1566,7 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 		step1Config.InnerParams = JSONStringify(jsonParamsStepPassword)
 
 		targetApi = "com.bloks.www.bloks.caa.reg.birthday.async"
-		paramsStep4, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		paramsStep4, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm, globalConfig.PollTimeoutSec)
 		if err != nil {
 			logFailureAtomically(workerID, phoneNum, targetApi, "STEP4_FAILED")
 			return false
@@ -1601,7 +1605,7 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 		step1Config.InnerParams = JSONStringify(jsonParamsStep5)
 
 		targetApi = "com.bloks.www.bloks.caa.reg.name_ig_and_soap.async"
-		paramsStep5, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		paramsStep5, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm, globalConfig.PollTimeoutSec)
 		if err != nil {
 			logFailureAtomically(workerID, phoneNum, targetApi, "STEP5_FAILED")
 			return false
@@ -1629,7 +1633,7 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 		step1Config.InnerParams = JSONStringify(jsonParamsStep6)
 
 		targetApi = "com.bloks.www.bloks.caa.reg.username.async"
-		paramsStep6, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		paramsStep6, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm, globalConfig.PollTimeoutSec)
 		if err != nil {
 			logFailureAtomically(workerID, phoneNum, targetApi, "STEP6_FAILED")
 			return false
@@ -1669,7 +1673,7 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 		step1Config.InnerParams = JSONStringify(jsonParamsStep7)
 
 		targetApi = "com.bloks.www.bloks.caa.reg.create.account.async"
-		paramsStep7, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm)
+		paramsStep7, err := PollUntilParamSuccess(targetApi, step1Config, 1, 2, 0, workerID, pm, globalConfig.PollTimeoutSec)
 		if err != nil {
 			logFailureAtomically(workerID, phoneNum, targetApi, "STEP7_FAILED")
 			return false
@@ -1718,11 +1722,9 @@ func ProcessRegistration(client *http.Client, phoneNum string, workerID int, pro
 		}
 
 		for i := 1; i <= finalizeRetries; i++ {
-			if time.Now().After(deadline) {
-				return false
-			}
+			// Removed deadline check to allow retries to run their course
 			updateDisplay(workerID, phoneNum, "Finalize", fmt.Sprintf("Finalizing (Attempt %d)...", i))
-			paramsStep8, err := PollUntilParamSuccess("", step1Config, 1, 2, 1, workerID, pm)
+			paramsStep8, err := PollUntilParamSuccess("", step1Config, 1, 2, 1, workerID, pm, 36000)
 			if err != nil {
 				// PollUntilParamSuccess internally rotates IP on error
 				if globalConfig.EnableHeaderRotation {

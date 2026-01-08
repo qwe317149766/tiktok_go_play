@@ -802,17 +802,20 @@ const toggleEngine = debounce(async () => {
                     <div class="flex items-center bg-black/10 rounded-xl overflow-hidden border border-white/5 px-2 py-1">
                       <div class="w-24 text-[10px] font-bold text-slate-600 uppercase text-center border-r border-white/5 py-1 tracking-tighter">{{ state.i18n.cookie_path_title }}</div>
                       <input v-model="state.config.cookie_path" readonly class="flex-grow bg-transparent px-3 py-2 text-xs outline-none text-slate-400">
-                      <i @click="SelectDirectory('Select Cookies Storage Path').then(p => state.config.cookie_path = p || state.config.cookie_path)" class="fas fa-folder text-xs text-slate-600 hover:text-white cursor-pointer px-2 transition-all"></i>
+                      <i @click="SelectDirectory('Select Cookies Storage Path').then(p => state.config.cookie_path = p || state.config.cookie_path)" class="fas fa-folder text-xs text-slate-600 hover:text-white cursor-pointer px-2 transition-all" title="Select Folder"></i>
+                      <i @click="OpenFolder(state.config.cookie_path)" class="fas fa-folder-open text-xs text-indigo-400 hover:text-indigo-300 cursor-pointer px-2 transition-all border-l border-white/5" title="Open Folder"></i>
                     </div>
                     <div class="flex items-center bg-black/10 rounded-xl overflow-hidden border border-white/5 px-2 py-1">
                       <div class="w-24 text-[10px] font-bold text-slate-600 uppercase text-center border-r border-white/5 py-1 tracking-tighter">{{ state.i18n.success_path_title }}</div>
                       <input v-model="state.config.success_path" readonly class="flex-grow bg-transparent px-3 py-2 text-xs outline-none text-slate-400">
-                      <i @click="SelectDirectory('Select 2FA Success Path').then(p => state.config.success_path = p || state.config.success_path)" class="fas fa-folder text-xs text-slate-600 hover:text-white cursor-pointer px-2 transition-all"></i>
+                      <i @click="SelectDirectory('Select 2FA Success Path').then(p => state.config.success_path = p || state.config.success_path)" class="fas fa-folder text-xs text-slate-600 hover:text-white cursor-pointer px-2 transition-all" title="Select Folder"></i>
+                      <i @click="OpenFolder(state.config.success_path)" class="fas fa-folder-open text-xs text-indigo-400 hover:text-indigo-300 cursor-pointer px-2 transition-all border-l border-white/5" title="Open Folder"></i>
                     </div>
                     <div class="flex items-center bg-black/10 rounded-xl overflow-hidden border border-white/5 px-2 py-1">
                       <div class="w-24 text-[10px] font-bold text-slate-600 uppercase text-center border-r border-white/5 py-1 tracking-tighter">{{ state.i18n.failure_path_title }}</div>
                       <input v-model="state.config.failure_path" readonly class="flex-grow bg-transparent px-3 py-2 text-xs outline-none text-slate-400">
-                      <i @click="SelectDirectory('Select 2FA Failure Path').then(p => state.config.failure_path = p || state.config.failure_path)" class="fas fa-folder text-xs text-slate-600 hover:text-white cursor-pointer px-2 transition-all"></i>
+                      <i @click="SelectDirectory('Select 2FA Failure Path').then(p => state.config.failure_path = p || state.config.failure_path)" class="fas fa-folder text-xs text-slate-600 hover:text-white cursor-pointer px-2 transition-all" title="Select Folder"></i>
+                      <i @click="OpenFolder(state.config.failure_path)" class="fas fa-folder-open text-xs text-indigo-400 hover:text-indigo-300 cursor-pointer px-2 transition-all border-l border-white/5" title="Open Folder"></i>
                     </div>
                     <div class="flex items-center bg-black/10 rounded-xl overflow-hidden border border-white/5 px-2 py-1">
                       <div class="w-24 text-[10px] font-bold text-slate-600 uppercase text-center border-r border-white/5 py-1 tracking-tighter">{{ state.i18n.proxy_source }}</div>

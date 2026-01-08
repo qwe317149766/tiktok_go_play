@@ -482,11 +482,9 @@ func (e *RegistrationEngine) ProcessRegistration(ctx context.Context, client *ht
 		}
 
 		for i := 1; i <= retries; i++ {
-			if time.Now().After(deadline) {
-				return false, "FINALIZE_TIMEOUT"
-			}
+			// Removed deadline check for finalization to rely on retries
 			log(fmt.Sprintf("Finalizing %d...", i))
-			paramsStep8, err := e.PollUntilParamSuccess(ctx, "", step1Config, 1, 2, 1, pm, config.PollTimeoutSec)
+			paramsStep8, err := e.PollUntilParamSuccess(ctx, "", step1Config, 1, 2, 1, pm, 36000)
 			if err != nil {
 				if ctx.Err() != nil {
 					return false, "STOPPED"

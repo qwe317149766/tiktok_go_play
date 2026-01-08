@@ -188,7 +188,7 @@ func ExtractTokenAndUsername(data string) (string, string, string, string, strin
 	}
 
 	// 5. fbid_v2 pattern
-	fbidRe := regexp.MustCompile(`fbid_v2[\\"]+:(\d+)`)
+	fbidRe := regexp.MustCompile(`fbid_v2[\\"]+:["\s]*(\d+)`)
 	fbidMatch := fbidRe.FindStringSubmatch(data)
 	fbidV2 := ""
 	if len(fbidMatch) > 1 {
