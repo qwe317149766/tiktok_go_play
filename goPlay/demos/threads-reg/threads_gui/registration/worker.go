@@ -525,13 +525,15 @@ func (e *RegistrationEngine) ProcessRegistration(ctx context.Context, client *ht
 
 				// 2FA
 				has2FA := false
+				twoFactorLine := ""
 				if config.EnableAuto2FA {
 					log("Enabling 2FA...")
 					hm_ig := NewInstagramHeaderManager()
 					api_ig := NewInstagramApi(client, hm_ig)
 					if err := api_ig.InitSession(resultLine); err == nil {
 						if secret, err := api_ig.Automate2FA(); err == nil {
-							resultLine = fmt.Sprintf("%s|2fa:%s", resultLine, secret)
+							// User requested specific format: 账号----密码----2fa
+							twoFactorLine = fmt.Sprintf("%s----%s----%s", finalUsername, password, secret)
 							has2FA = true
 						} else {
 							log(fmt.Sprintf("2FA Failed: %v", err))
@@ -541,7 +543,9 @@ func (e *RegistrationEngine) ProcessRegistration(ctx context.Context, client *ht
 
 				// Using logger hack to pass success string back
 				if has2FA {
-					return true, "SUCCESS_2FA:" + resultLine
+					// Return BOTH lines separated by "@@@@" so app.go can split them
+					// Format: SUCCESS_2FA:CookiesLine@@@@2FALine
+					return true, "SUCCESS_2FA:" + resultLine + "@@@@" + twoFactorLine
 				}
 				return true, "SUCCESS:" + resultLine
 			}

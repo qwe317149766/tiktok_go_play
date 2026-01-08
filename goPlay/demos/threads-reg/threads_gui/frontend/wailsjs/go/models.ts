@@ -123,6 +123,12 @@ export namespace config {
 	    alert_api_failed: string;
 	    confirm_clear_stats: string;
 	    confirm_delete_file: string;
+	    timeout_config: string;
+	    timeout_config_desc: string;
+	    poll_timeout: string;
+	    sms_timeout: string;
+	    http_timeout: string;
+	    finalize_retries: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new LanguagePack(source);
@@ -192,6 +198,12 @@ export namespace config {
 	        this.alert_api_failed = source["alert_api_failed"];
 	        this.confirm_clear_stats = source["confirm_clear_stats"];
 	        this.confirm_delete_file = source["confirm_delete_file"];
+	        this.timeout_config = source["timeout_config"];
+	        this.timeout_config_desc = source["timeout_config_desc"];
+	        this.poll_timeout = source["poll_timeout"];
+	        this.sms_timeout = source["sms_timeout"];
+	        this.http_timeout = source["http_timeout"];
+	        this.finalize_retries = source["finalize_retries"];
 	    }
 	}
 

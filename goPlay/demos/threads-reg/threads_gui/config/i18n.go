@@ -65,6 +65,14 @@ type LanguagePack struct {
 	AlertAPIFailed          string `json:"alert_api_failed"`
 	ConfirmClearStats       string `json:"confirm_clear_stats"`
 	ConfirmDeleteFile       string `json:"confirm_delete_file"`
+
+	// Timeouts
+	TimeoutConfig     string `json:"timeout_config"`
+	TimeoutConfigDesc string `json:"timeout_config_desc"`
+	PollTimeout       string `json:"poll_timeout"`
+	SMSTimeout        string `json:"sms_timeout"`
+	HTTPTimeout       string `json:"http_timeout"`
+	FinalizeRetries   string `json:"finalize_retries"`
 }
 
 var Languages = map[string]LanguagePack{
@@ -131,6 +139,12 @@ var Languages = map[string]LanguagePack{
 		AlertAPIFailed:          "API 连接失败，请检查日志。",
 		ConfirmClearStats:       "确定要清空所有统计数据吗？",
 		ConfirmDeleteFile:       "确定要删除这个文件吗？",
+		TimeoutConfig:           "超时与重试配置",
+		TimeoutConfigDesc:       "配置请求超时、轮询等待时间及失败重试策略。",
+		PollTimeout:             "全局轮询超时 (秒)",
+		SMSTimeout:              "短信等待超时 (秒)",
+		HTTPTimeout:             "HTTP 请求超时 (秒)",
+		FinalizeRetries:         "最终确认重试次数",
 	},
 	"en-US": {
 		LoginTitle:              "IG Registration Assistant",
@@ -195,6 +209,12 @@ var Languages = map[string]LanguagePack{
 		AlertAPIFailed:          "API Connection Failed. Please check the logs.",
 		ConfirmClearStats:       "Are you sure you want to clear all statistics?",
 		ConfirmDeleteFile:       "Are you sure you want to delete this file?",
+		TimeoutConfig:           "Timeout & Retries",
+		TimeoutConfigDesc:       "Configure improved timeout settings and retry logic for better success rates.",
+		PollTimeout:             "Global Poll Timeout (sec)",
+		SMSTimeout:              "SMS Wait Timeout (sec)",
+		HTTPTimeout:             "HTTP Request Timeout (sec)",
+		FinalizeRetries:         "Finalize Retry Count",
 	},
 	"ru-RU": {
 		LoginTitle:              "IG Registration Assistant",
@@ -259,5 +279,11 @@ var Languages = map[string]LanguagePack{
 		AlertAPIFailed:          "Ошибка соединения с API. Проверьте логи.",
 		ConfirmClearStats:       "Вы уверены, что хотите очистить всю статистику?",
 		ConfirmDeleteFile:       "Вы уверены, что хотите удалить этот файл?",
+		TimeoutConfig:           "Тайм-аут и повторные попытки",
+		TimeoutConfigDesc:       "Настройте параметры тайм-аута и повторных попыток для повышения успешности.",
+		PollTimeout:             "Глобальный тайм-аут опроса (сек)",
+		SMSTimeout:              "Тайм-аут ожидания SMS (сек)",
+		HTTPTimeout:             "Тайм-аут HTTP-запроса (сек)",
+		FinalizeRetries:         "Повторные попытки завершения",
 	},
 }

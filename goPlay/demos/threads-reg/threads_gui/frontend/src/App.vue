@@ -35,7 +35,11 @@ const state = reactive({
     concurrency: 10,
     auto_2fa: true,
     font_size: 14,
-    theme_color: 'indigo'
+    theme_color: 'indigo',
+    poll_timeout_sec: 300,
+    sms_wait_timeout_sec: 120,
+    http_request_timeout_sec: 30,
+    finalize_retries: 20
   },
   stats: {
     success: 0,
@@ -209,7 +213,13 @@ onMounted(async () => {
       alert_api_success: "API Connection Successful!",
       alert_api_failed: "API Connection Failed. Please check the logs.",
       confirm_clear_stats: "Are you sure you want to clear all statistics?",
-      confirm_delete_file: "Are you sure you want to delete this file?"
+      confirm_delete_file: "Are you sure you want to delete this file?",
+      timeout_config: "Timeouts & Retries",
+      timeout_config_desc: "Configure improved timeout settings and retry logic.",
+      poll_timeout: "Global Poll Timeout (sec)",
+      sms_timeout: "SMS Wait Timeout (sec)",
+      http_timeout: "HTTP Request Timeout (sec)",
+      finalize_retries: "Finalize Retry Count"
     }
   }
   
@@ -317,7 +327,16 @@ function deleteFile(path) {
 
 // Watch tab change to refresh archives
 watch(() => state.activeTab, (newTab) => {
-  if (newTab === 'archives') fetchArchives()
+  if (newTab === 'archives') {
+    fetchArchives()
+    nextTick(() => {
+        updateContainerHeight()
+    })
+  } else if (newTab === 'execution') {
+      nextTick(() => {
+        updateContainerHeight()
+      })
+  }
 })
 
 function chooseSuccessDir() {
@@ -558,9 +577,9 @@ const toggleEngine = debounce(async () => {
         </nav>
 
         <div class="pt-6 border-t border-white/5 space-y-4">
-          <div class="flex items-center justify-between text-[11px] text-slate-500">
+          <div class="flex items-center justify-center space-x-4 text-[11px] text-slate-500">
             <span>{{ state.i18n.lang_select }}</span>
-            <select v-model="state.lang" class="bg-transparent text-slate-300 outline-none cursor-pointer">
+            <select v-model="state.lang" class="bg-transparent text-slate-300 outline-none cursor-pointer text-center">
               <option value="zh-CN">中文</option>
               <option value="en-US">English</option>
               <option value="ru-RU">Русский</option>
@@ -684,7 +703,7 @@ const toggleEngine = debounce(async () => {
 
         <!-- PARAMETERS TAB -->
         <template v-else-if="state.activeTab === 'parameters'">
-          <div class="flex-grow flex flex-col adaptive-layout overflow-hidden px-4">
+          <div class="flex-grow flex flex-col adaptive-layout overflow-hidden px-4 min-h-0">
             <!-- Compact Header -->
             <div class="flex items-center justify-between py-3 border-b border-white/5 h-16 shrink-0">
               <div class="flex items-center space-x-3">
@@ -766,28 +785,9 @@ const toggleEngine = debounce(async () => {
                   </div>
                 </div>
 
-                <!-- Card 3: Integration -->
-                <div class="glass p-4 rounded-xl border border-white/5 space-y-4 relative">
-                  <div class="flex items-center justify-between border-b border-white/5 pb-2">
-                    <h3 class="text-amber-400 font-bold text-[10px] uppercase tracking-wider flex items-center">
-                      <i class="fas fa-plug mr-2 opacity-70"></i> {{ state.i18n.external_int }}
-                    </h3>
-                    <div class="has-tooltip">
-                       <i class="fas fa-info-circle text-slate-700 cursor-help hover:text-amber-400 text-[10px] transition-colors"></i>
-                       <div class="tooltip-box">{{ state.i18n.external_int_desc }}</div>
-                    </div>
-                  </div>
 
-                  <div class="space-y-2">
-                    <label class="text-xs font-medium text-slate-500 pl-1">{{ state.i18n.api_push_url }}</label>
-                    <div class="flex space-x-2">
-                      <input v-model="state.config.push_url" type="text" class="flex-grow bg-black/20 border border-white/5 rounded-xl py-2.5 px-4 text-sm font-mono outline-none focus:border-amber-500/20 transition-all" placeholder="https://...">
-                      <button @click="testPushURL" class="bg-amber-500/5 hover:bg-amber-500/10 text-amber-500 px-3 rounded-xl border border-amber-500/10 text-xs"><i class="fas fa-link"></i></button>
-                    </div>
-                  </div>
-                </div>
 
-                <div class="glass p-4 rounded-xl border border-white/5 space-y-4 relative">
+                <div class="glass p-4 rounded-xl border border-white/5 space-y-4 relative col-span-2">
                   <div class="flex items-center justify-between border-b border-white/5 pb-2">
                     <h3 class="text-slate-400 font-bold text-[10px] uppercase tracking-wider flex items-center">
                       <i class="fas fa-hdd mr-2 opacity-70"></i> {{ state.i18n.storage_paths }}
@@ -822,6 +822,38 @@ const toggleEngine = debounce(async () => {
                   </div>
                 </div>
 
+                <!-- Card 5: Timeouts & Retries -->
+                <div class="glass p-4 rounded-xl border border-white/5 space-y-4 relative col-span-2">
+                  <div class="flex items-center justify-between border-b border-white/5 pb-2">
+                    <h3 class="text-rose-400 font-bold text-[10px] uppercase tracking-wider flex items-center">
+                      <i class="fas fa-clock mr-2 opacity-70"></i> {{ state.i18n.timeout_config }}
+                    </h3>
+                    <div class="has-tooltip">
+                       <i class="fas fa-info-circle text-slate-700 cursor-help hover:text-rose-400 text-[10px] transition-colors"></i>
+                       <div class="tooltip-box">{{ state.i18n.timeout_config_desc }}</div>
+                    </div>
+                  </div>
+
+                  <div class="grid grid-cols-4 gap-4">
+                     <div class="space-y-2">
+                       <label class="text-xs font-medium text-slate-500 pl-1">{{ state.i18n.poll_timeout }}</label>
+                       <input v-model.number="state.config.poll_timeout_sec" type="number" class="w-full bg-black/20 border border-white/5 rounded-xl py-2.5 px-4 text-sm outline-none focus:border-rose-500/20 transition-all font-bold text-rose-400/90">
+                     </div>
+                     <div class="space-y-2">
+                       <label class="text-xs font-medium text-slate-500 pl-1">{{ state.i18n.sms_timeout }}</label>
+                       <input v-model.number="state.config.sms_wait_timeout_sec" type="number" class="w-full bg-black/20 border border-white/5 rounded-xl py-2.5 px-4 text-sm outline-none focus:border-rose-500/20 transition-all font-bold text-rose-400/90">
+                     </div>
+                     <div class="space-y-2">
+                       <label class="text-xs font-medium text-slate-500 pl-1">{{ state.i18n.http_timeout }}</label>
+                       <input v-model.number="state.config.http_request_timeout_sec" type="number" class="w-full bg-black/20 border border-white/5 rounded-xl py-2.5 px-4 text-sm outline-none focus:border-rose-500/20 transition-all font-bold text-rose-400/90">
+                     </div>
+                     <div class="space-y-2">
+                       <label class="text-xs font-medium text-slate-500 pl-1">{{ state.i18n.finalize_retries }}</label>
+                       <input v-model.number="state.config.finalize_retries" type="number" class="w-full bg-black/20 border border-white/5 rounded-xl py-2.5 px-4 text-sm outline-none focus:border-rose-500/20 transition-all font-bold text-rose-400/90">
+                     </div>
+                  </div>
+                </div>
+
               </div>
             </div>
           </div>
@@ -829,7 +861,7 @@ const toggleEngine = debounce(async () => {
 
         <!-- APP SETTINGS TAB -->
         <template v-else-if="state.activeTab === 'app_settings'">
-          <div class="flex-grow flex flex-col adaptive-layout overflow-hidden px-4">
+          <div class="flex-grow flex flex-col adaptive-layout overflow-hidden px-4 min-h-0">
              <div class="flex items-center justify-between py-3 border-b border-white/5 h-16 shrink-0">
               <div class="flex items-center space-x-3">
                 <div class="p-1.5 bg-primary-10 rounded-lg shrink-0">
@@ -873,6 +905,28 @@ const toggleEngine = debounce(async () => {
                        >
                          <i v-if="state.config.theme_color === key" class="fas fa-check text-white text-xs drop-shadow-md"></i>
                        </button>
+                    </div>
+                  </div>
+
+                   <!-- External Integration (Moved) -->
+                  <div class="glass p-6 rounded-3xl border border-white/5 space-y-6 col-span-2">
+                     <div class="flex items-center justify-between border-b border-white/5 pb-2">
+                        <h3 class="text-xs font-bold text-slate-400 uppercase tracking-wider flex items-center">
+                            <i class="fas fa-plug mr-2 opacity-70"></i> {{ state.i18n.external_int }}
+                        </h3>
+                        <div class="has-tooltip">
+                           <i class="fas fa-info-circle text-slate-700 cursor-help hover:text-white text-[10px] transition-colors"></i>
+                           <div class="tooltip-box">{{ state.i18n.external_int_desc }}</div>
+                        </div>
+                    </div>
+                    <div class="space-y-4">
+                      <div class="space-y-2">
+                        <label class="text-xs font-medium text-slate-500 pl-1">{{ state.i18n.api_push_url }}</label>
+                        <div class="flex space-x-2">
+                          <input v-model="state.config.push_url" type="text" class="flex-grow bg-black/20 border border-white/5 rounded-xl py-3 px-4 text-sm font-mono outline-none focus:border-amber-500/20 transition-all font-bold text-slate-300 placeholder:text-slate-700" placeholder="https://...">
+                          <button @click="testPushURL" class="bg-amber-500/5 hover:bg-amber-500/10 text-amber-500 px-4 rounded-xl border border-amber-500/10 text-xs font-bold transition-all"><i class="fas fa-link mr-1"></i> TEST</button>
+                        </div>
+                      </div>
                     </div>
                   </div>
               </div>

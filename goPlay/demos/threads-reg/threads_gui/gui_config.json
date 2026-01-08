@@ -14,14 +14,14 @@
   "max_reg_count": 0,
   "max_phone_usage": 0,
   "font_size": 16,
-  "theme_color": "amber",
+  "theme_color": "rose",
   "proxy_file": "E:\\coding\\linux_file\\auto_pro\\TIKTOK_GO_PLAY\\goPlay\\demos\\threads-reg\\proxy.txt",
   "max_success_per_file": 0,
-  "poll_timeout_sec": 300,
-  "sms_wait_timeout_sec": 120,
-  "finalize_retries": 20,
+  "poll_timeout_sec": 60,
+  "sms_wait_timeout_sec": 30,
+  "finalize_retries": 12,
   "enable_header_rotation": false,
   "enable_anomalous_ua": false,
   "enable_ios": false,
-  "http_request_timeout_sec": 30
+  "http_request_timeout_sec": 15
 }

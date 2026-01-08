@@ -365,18 +365,39 @@ func (a *App) RunRegistration(params map[string]interface{}) {
 				success, resMsg := regEngine.ProcessRegistration(ctx, client, p, wid, currProxy, smsMgr, pm, regConf)
 
 				if success {
-					content := strings.TrimPrefix(resMsg, "SUCCESS:")
-					content = strings.TrimPrefix(content, "SUCCESS_2FA:")
+					// Clean up the message prefix
+					rawMsg := strings.TrimPrefix(resMsg, "SUCCESS:")
+					rawMsg = strings.TrimPrefix(rawMsg, "SUCCESS_2FA:")
 					has2FA := strings.Contains(resMsg, "2FA")
+
+					cookieContent := rawMsg
+					twoFactorContent := ""
+
+					// If 2FA, split the content
+					if has2FA && strings.Contains(rawMsg, "@@@@") {
+						parts := strings.Split(rawMsg, "@@@@")
+						if len(parts) == 2 {
+							cookieContent = parts[0]
+							twoFactorContent = parts[1]
+						}
+					}
+
 					totalSuccess := smsMgr.GetTotalSuccessCount()
 
-					a.saveResult(a.config.CookiePath, p, content, has2FA, int64(totalSuccess))
+					// 1. Always save clean Cookie info to Cookie Path
+					a.saveResult(a.config.CookiePath, p, cookieContent, false, int64(totalSuccess))
 
-					targetPath := a.config.SuccessPath
-					if !has2FA {
-						targetPath = a.config.FailurePath
+					// 2. Handle 2FA specific paths
+					if a.config.Auto2FA {
+						if has2FA && twoFactorContent != "" {
+							// 2FA Success: Save simplified 2FA data to SuccessPath
+							a.saveResult(a.config.SuccessPath, p, twoFactorContent, true, int64(totalSuccess))
+						} else {
+							// 2FA Failed (but account registered): Save Cookie data to FailurePath
+							// This allows user to recover the account even if 2FA failed
+							a.saveResult(a.config.FailurePath, p, cookieContent, false, int64(totalSuccess))
+						}
 					}
-					a.saveResult(targetPath, p, content, has2FA, int64(totalSuccess))
 
 					newCount := smsMgr.IncrementSuccess(p)
 					a.appendBackup(p, newCount)
@@ -392,7 +413,7 @@ func (a *App) RunRegistration(params map[string]interface{}) {
 					}
 
 					username := "unknown"
-					if parts := strings.Split(content, ":"); len(parts) > 0 {
+					if parts := strings.Split(cookieContent, ":"); len(parts) > 0 {
 						username = parts[0]
 					}
 					a.Log(fmt.Sprintf("[Success] Account %s registered (2FA: %v)", username, has2FA))
@@ -401,7 +422,7 @@ func (a *App) RunRegistration(params map[string]interface{}) {
 						go a.pushToAPI(map[string]interface{}{
 							"account": p,
 							"status":  "success",
-							"data":    content,
+							"data":    cookieContent,
 							"2fa":     has2FA,
 						})
 					}
@@ -410,15 +431,18 @@ func (a *App) RunRegistration(params map[string]interface{}) {
 						return
 					}
 					a.saveFailure(p, resMsg, wid)
-					newFail := atomic.AddInt64(&failCnt, 1)
 
-					select {
-					case a.statsChan <- map[string]interface{}{
-						"success":       atomic.LoadInt64(&successCnt),
-						"failed":        newFail,
-						"total_success": smsMgr.GetTotalSuccessCount(),
-					}:
-					default:
+					// Only count specific failures as requested: INSTAGRAM_USER or ATTEMPTS_EXHAUSTED
+					if resMsg == "INSTAGRAM_USER" || resMsg == "ATTEMPTS_EXHAUSTED" {
+						newFail := atomic.AddInt64(&failCnt, 1)
+						select {
+						case a.statsChan <- map[string]interface{}{
+							"success":       atomic.LoadInt64(&successCnt),
+							"failed":        newFail,
+							"total_success": smsMgr.GetTotalSuccessCount(),
+						}:
+						default:
+						}
 					}
 					a.Log(fmt.Sprintf("[Failed] Worker %d finished FAILED: %s", wid, resMsg))
 				}
